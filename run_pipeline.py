@@ -37,8 +37,9 @@ INPUT_UPDATE_DIR = INPUT_DIR / "rate updates"
 
 
 def choose_file(files, prompt, cli_arg_index):
-    if len(sys.argv) > cli_arg_index:
-        raw = sys.argv[cli_arg_index].strip()
+    cli_values = [arg for arg in sys.argv[1:] if arg and not str(arg).startswith("-")]
+    if len(cli_values) >= cli_arg_index:
+        raw = cli_values[cli_arg_index - 1].strip()
         if raw.isdigit():
             idx = int(raw) - 1
             if 0 <= idx < len(files):
