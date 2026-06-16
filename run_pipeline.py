@@ -37,18 +37,25 @@ INPUT_UPDATE_DIR = INPUT_DIR / "rate updates"
 
 
 def choose_file(files, prompt, cli_arg_index):
-    cli_values = [arg for arg in sys.argv[1:] if arg and not str(arg).startswith("-")]
-    if len(cli_values) >= cli_arg_index:
-        raw = cli_values[cli_arg_index - 1].strip()
+    def resolve_selector(raw):
         if raw.isdigit():
             idx = int(raw) - 1
             if 0 <= idx < len(files):
                 return files[idx]
-            raise ValueError(f"Index out of range for arg {cli_arg_index}: {raw}")
+            return None
         for f in files:
             if f.name == raw:
                 return f
-        raise FileNotFoundError(f"File not found for arg {cli_arg_index}: {raw}")
+        return None
+
+    # Notebook runtimes inject non-user argv values (e.g., kernel json path).
+    # Keep only selectors that actually resolve to one of available files.
+    cli_values = [arg for arg in sys.argv[1:] if arg and not str(arg).startswith("-")]
+    valid_selectors = [arg for arg in cli_values if resolve_selector(str(arg).strip()) is not None]
+    if len(valid_selectors) >= cli_arg_index:
+        selected = resolve_selector(valid_selectors[cli_arg_index - 1].strip())
+        if selected is not None:
+            return selected
 
     print(prompt)
     for i, f in enumerate(files, start=1):
