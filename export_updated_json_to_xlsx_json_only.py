@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -132,13 +133,28 @@ def collect_cost_order(records, payload):
             return 99999999
         return int(start.strftime("%Y%m%d"))
 
+    def is_plain_baf_ets(cost_name):
+        name = str(cost_name)
+        if name in ("BAF Fee", "EU ETS Fee"):
+            return True
+        # Plain form has only container in parentheses, e.g. "BAF Fee (22G0)".
+        return bool(re.match(r"^(BAF Fee|EU ETS Fee) \([A-Z0-9]+\)$", name))
+
+    def container_key_for_sort(cost_name, container):
+        name = str(cost_name)
+        if name in ("BAF Fee", "EU ETS Fee"):
+            return -1
+        order = {"22G0": 22, "25G0": 25, "42G0": 42, "45G0": 45, "52G0": 52}
+        return order.get(str(container), 999)
+
     # Apply container/group sorting ONLY to BAF/EU ETS, keep others as-is.
     special = [n for n in first_seen if group_key(n) in (0, 1)]
     special_sorted = sorted(
         special,
         key=lambda n: (
-            container_key(cost_meta_for_sort[n]["container"]),
+            container_key_for_sort(n, cost_meta_for_sort[n]["container"]),
             group_key(n),
+            0 if is_plain_baf_ets(n) else 1,
             validity_key(cost_meta_for_sort[n]["validity"]),
             n,
         ),
@@ -190,27 +206,18 @@ def collect_cost_meta(records, payload):
     return meta
 
 
+def should_show_flat_column(cost_name):
+    name = str(cost_name)
+    return name == "Base Rate (BASE_STAT_FRK)" or name == "RoRo Fee"
+
+
 def collect_cost_metrics(records, cost_names):
-    # Drop Flat metric for costs where flat_min is null in all rows.
     metrics = {}
     for cost_name in cost_names:
-        # Business rule: for containerized Base Rate, do not show Flat column.
-        if str(cost_name).startswith("Base Rate (") and str(cost_name) != "Base Rate (BASE_STAT_FRK)":
+        if should_show_flat_column(cost_name):
+            metrics[cost_name] = ["currency", "flat_min", "p_unit"]
+        else:
             metrics[cost_name] = ["currency", "p_unit"]
-            continue
-
-        has_flat_value = False
-        for rec in records:
-            for rate in rec.get("rates", []):
-                if str(rate.get("cost_name", "")) != cost_name:
-                    continue
-                if rate.get("flat_min") is not None:
-                    has_flat_value = True
-                    break
-            if has_flat_value:
-                break
-        metric_list = ["currency", "p_unit"] if not has_flat_value else ["currency", "flat_min", "p_unit"]
-        metrics[cost_name] = metric_list
     return metrics
 
 
@@ -314,7 +321,8 @@ def write_records(ws, records, route_keys, cost_names, cost_metrics, payload):
             base_col = cost_start_col[name]
             metric_keys = cost_metrics[name]
             for offset, metric_key in enumerate(metric_keys):
-                value = rate.get(metric_key)
+                # Layout rule: keep Flat (MIN) column but never populate values.
+                value = None if metric_key == "flat_min" else rate.get(metric_key)
                 ws.cell(row, base_col + offset, value)
             if rate.get("update_note") in {"(new)", "(updated)"}:
                 for offset in range(len(metric_keys)):
