@@ -176,6 +176,24 @@ def find_header_row(rows):
     raise ValueError("Could not find the 'Lane #' header row in 'Rate card' sheet.")
 
 
+def collect_route_columns(data_header):
+    route_columns = []
+    for col_idx, header in enumerate(data_header):
+        label = str(header).strip() if header is not None else ""
+        if label in {"Currency", "Flat", "p/unit"}:
+            break
+        if label:
+            route_columns.append((col_idx, label))
+    return route_columns
+
+
+def key_column_index(route_columns):
+    for col_idx, label in route_columns:
+        if label == "KEY":
+            return col_idx
+    return 2
+
+
 def parse_file(file_path: Path):
     workbook = load_workbook(file_path, data_only=True)
     if TARGET_SHEET not in workbook.sheetnames:
@@ -189,6 +207,8 @@ def parse_file(file_path: Path):
 
     header_idx = find_header_row(rows)
     data_header = rows[header_idx]
+    route_columns = collect_route_columns(data_header)
+    key_col = key_column_index(route_columns)
     charge_title_row = rows[header_idx - 4] if header_idx >= 4 else tuple([None] * len(data_header))
     apply_if_row = rows[header_idx - 3] if header_idx >= 3 else tuple([None] * len(data_header))
     rate_by_row = rows[header_idx - 2] if header_idx >= 2 else tuple([None] * len(data_header))
@@ -245,27 +265,17 @@ def parse_file(file_path: Path):
         if all(cell is None or cell == "" for cell in row):
             continue
 
-        key = to_primitive(row[2]) if len(row) > 2 else None
+        key = to_primitive(row[key_col]) if len(row) > key_col else None
         if key in (None, ""):
             continue
 
+        route = {}
+        for col_idx, label in route_columns:
+            route[label] = to_primitive(row[col_idx]) if col_idx < len(row) else None
+
         record = {
             "row_number": row_idx + 1,
-            "route": {
-                "Lane #": to_primitive(row[0]) if len(row) > 0 else None,
-                "Transporeon ID": to_primitive(row[1]) if len(row) > 1 else None,
-                "KEY": key,
-                "Carrier": to_primitive(row[3]) if len(row) > 3 else None,
-                "SERVICE": to_primitive(row[4]) if len(row) > 4 else None,
-                "SERVICE_C": to_primitive(row[5]) if len(row) > 5 else None,
-                "Service": to_primitive(row[6]) if len(row) > 6 else None,
-                "Valid from": to_primitive(row[7]) if len(row) > 7 else None,
-                "Valid to": to_primitive(row[8]) if len(row) > 8 else None,
-                "Origin Port": to_primitive(row[9]) if len(row) > 9 else None,
-                "ORIGIN_COUNTRY__C": to_primitive(row[10]) if len(row) > 10 else None,
-                "Destination Port": to_primitive(row[11]) if len(row) > 11 else None,
-                "DESTINATION_COUNTRY__C": to_primitive(row[12]) if len(row) > 12 else None,
-            },
+            "route": route,
             "rates": [],
         }
 
