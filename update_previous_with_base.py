@@ -51,6 +51,69 @@ def format_ddmmyyyy(date_value):
     return date_value.strftime("%d.%m.%Y")
 
 
+def parse_validity_range(value):
+    if not value:
+        return (None, None)
+    raw = str(value).strip()
+    if "-" not in raw:
+        return (None, None)
+    start_raw, end_raw = raw.split("-", 1)
+    return parse_ddmmyyyy(start_raw.strip()), parse_ddmmyyyy(end_raw.strip())
+
+
+def validity_ranges_intersect(period_a_from, period_a_to, period_b_from, period_b_to):
+    if not all([period_a_from, period_a_to, period_b_from, period_b_to]):
+        return True
+    return not (period_a_to < period_b_from or period_a_from > period_b_to)
+
+
+def clamp_period_to_rate_card(period_from, period_to, card_from, card_to):
+    if not (period_from and period_to):
+        return (None, None)
+    start = period_from
+    end = period_to
+    if card_from:
+        start = max(start, card_from)
+    if card_to:
+        end = min(end, card_to)
+    if start > end:
+        return (None, None)
+    return (start, end)
+
+
+def is_bu_related_service(service_value):
+    return str(service_value or "").endswith("_BU")
+
+
+def is_bu_related_update(update_record):
+    route = update_record.get("route", {})
+    service = route.get("SERVICE__C")
+    if is_bu_related_service(service):
+        return True
+    key = str(route.get("KEY") or "")
+    return "_CY-CY_BU-" in key or "_CY-CY_BU_" in key
+
+
+def filter_bu_service_conflicts(update_records):
+    grouped = {}
+    for rec in update_records:
+        tid = rec.get("route", {}).get("Transporeon ID") or ""
+        grouped.setdefault(tid, []).append(rec)
+
+    drop_ids = set()
+    for tid, group in grouped.items():
+        if not tid:
+            continue
+        has_standard = any(not is_bu_related_update(r) for r in group)
+        if not has_standard:
+            continue
+        for rec in group:
+            if is_bu_related_update(rec):
+                drop_ids.add(id(rec))
+
+    return [rec for rec in update_records if id(rec) not in drop_ids]
+
+
 def map_container_type(update_container_type):
     if not update_container_type:
         return None
@@ -220,8 +283,14 @@ def apply_update_only_to_costs(lane_record, update_record, base_rates_template):
     lane_record["rates"] = lane_costs
 
 
-def build_new_lane(update_record, previous_records, base_rates_template):
+def build_new_lane(update_record, previous_records, base_rates_template, card_from=None, card_to=None):
     route = update_record.get("route", {})
+    upd_from = parse_yyyymmdd(route.get("RATE_EFFECTIVE_DATE__C"))
+    upd_to = parse_yyyymmdd(route.get("RATE_EXPIRATION_DATE__C"))
+    eff_from, eff_to = clamp_period_to_rate_card(upd_from, upd_to, card_from, card_to)
+    if not (eff_from and eff_to):
+        return None
+
     lane = {
         "row_number": next_row_number(previous_records),
         "route": {
@@ -232,8 +301,8 @@ def build_new_lane(update_record, previous_records, base_rates_template):
             "SERVICE": "not PRECARRIAGE/ONCARRIAGE",
             "SERVICE_C": route.get("SERVICE__C"),
             "Service": trim_service(route.get("SERVICE__C")),
-            "Valid from": to_ddmmyyyy(route.get("RATE_EFFECTIVE_DATE__C")),
-            "Valid to": to_ddmmyyyy(route.get("RATE_EXPIRATION_DATE__C")),
+            "Valid from": format_ddmmyyyy(eff_from),
+            "Valid to": format_ddmmyyyy(eff_to),
             "Origin Port": route.get("ORIGIN_LOCATION_NAME__C"),
             "ORIGIN_COUNTRY__C": route.get("ORIGIN_COUNTRY__C"),
             "Destination Port": route.get("DESTINATION_LOCATION_NAME__C"),
@@ -339,6 +408,60 @@ def renumber_rows_and_lanes(records):
         rec.setdefault("route", {})["Lane #"] = str(idx + 1)
 
 
+def intersection_period(lane_from, lane_to, upd_from, upd_to):
+    if not all([lane_from, lane_to, upd_from, upd_to]):
+        return (None, None)
+    start = max(lane_from, upd_from)
+    end = min(lane_to, upd_to)
+    if start > end:
+        return (None, None)
+    return (start, end)
+
+
+def needs_validity_split(lane_from, lane_to, upd_from, upd_to):
+    int_from, int_to = intersection_period(lane_from, lane_to, upd_from, upd_to)
+    if int_from is None:
+        return False
+    return not (int_from == lane_from and int_to == lane_to)
+
+
+def build_lane_segments(lane, lane_from, lane_to, upd_from, upd_to, card_from=None, card_to=None):
+    int_from, int_to = intersection_period(lane_from, lane_to, upd_from, upd_to)
+    if int_from is None:
+        return []
+    int_from, int_to = clamp_period_to_rate_card(int_from, int_to, card_from, card_to)
+    if int_from is None:
+        return []
+
+    segments = []
+    if lane_from < int_from:
+        prefix = deepcopy(lane)
+        prefix["route"]["Valid to"] = format_ddmmyyyy(int_from - timedelta(days=1))
+        prefix["route"]["update_note"] = "(updated)"
+        prefix["route"]["update_source"] = "BASE"
+        prefix["route"]["update_changed_fields"] = ["Valid to"]
+        segments.append({"kind": "prefix", "lane": prefix})
+
+    update_segment = deepcopy(lane)
+    update_segment["route"]["Valid from"] = format_ddmmyyyy(int_from)
+    update_segment["route"]["Valid to"] = format_ddmmyyyy(int_to)
+    update_segment["route"]["update_note"] = "(new)"
+    update_segment["route"]["update_source"] = "BASE"
+    update_segment["route"].pop("update_changed_fields", None)
+    segments.append({"kind": "update", "lane": update_segment})
+
+    if int_to < lane_to:
+        suffix = deepcopy(lane)
+        suffix["route"]["Valid from"] = format_ddmmyyyy(int_to + timedelta(days=1))
+        suffix["route"]["Valid to"] = format_ddmmyyyy(lane_to)
+        suffix["route"]["update_note"] = "(new)"
+        suffix["route"]["update_source"] = "BASE"
+        suffix["route"].pop("update_changed_fields", None)
+        segments.append({"kind": "suffix", "lane": suffix})
+
+    return segments
+
+
 def main():
     files = list_json_files()
     previous_json = choose_file(files, "Choose previous rate card JSON to update:", 1)
@@ -351,10 +474,12 @@ def main():
     update_records = [r for r in updates.get("records", []) if r.get("sheet_name") == "BASE"]
     if not update_records:
         raise ValueError("No BASE records found in rate update file.")
+    update_records = filter_bu_service_conflicts(update_records)
 
     template_record = get_lane_template(previous_records) if previous_records else {"rates": []}
     base_rates_template = template_record.get("rates", [])
     new_cost_names = ensure_global_cost_layout(previous_records, base_rates_template, update_records)
+    card_from, card_to = parse_validity_range(previous.get("rate_card_validity"))
 
     for upd in update_records:
         tid = upd.get("route", {}).get("Transporeon ID")
@@ -363,13 +488,17 @@ def main():
 
         upd_from = parse_yyyymmdd(upd.get("route", {}).get("RATE_EFFECTIVE_DATE__C"))
         upd_to = parse_yyyymmdd(upd.get("route", {}).get("RATE_EXPIRATION_DATE__C"))
+        if card_from and card_to and upd_from and upd_to:
+            if not validity_ranges_intersect(upd_from, upd_to, card_from, card_to):
+                continue
         matching_idxs = [
             i for i, rec in enumerate(previous_records) if rec.get("route", {}).get("Transporeon ID") == tid
         ]
 
         if not matching_idxs:
-            new_lane = build_new_lane(upd, previous_records, base_rates_template)
-            previous_records.append(new_lane)
+            new_lane = build_new_lane(upd, previous_records, base_rates_template, card_from, card_to)
+            if new_lane is not None:
+                previous_records.append(new_lane)
             continue
 
         inserted_offset = 0
@@ -384,23 +513,21 @@ def main():
             if lane_to < upd_from or lane_from > upd_to:
                 continue
 
-            # If lane starts before update period and intersects it, split lane.
-            if lane_from < upd_from <= lane_to:
-                lane["route"]["Valid to"] = format_ddmmyyyy(upd_from - timedelta(days=1))
-                lane.setdefault("route", {})["update_note"] = "(updated)"
-                lane["route"]["update_source"] = "BASE"
-                lane["route"]["update_changed_fields"] = ["Valid to"]
-
-                new_lane = deepcopy(lane)
-                new_lane["route"]["Valid from"] = format_ddmmyyyy(upd_from)
-                new_lane["route"]["Valid to"] = format_ddmmyyyy(upd_to)
-                new_lane.setdefault("route", {})["update_note"] = "(new)"
-                new_lane["route"]["update_source"] = "BASE"
-                new_lane["route"].pop("update_changed_fields", None)
-                apply_update_only_to_costs(new_lane, upd, base_rates_template)
-
-                previous_records.insert(idx + 1, new_lane)
-                inserted_offset += 1
+            if needs_validity_split(lane_from, lane_to, upd_from, upd_to):
+                segments = build_lane_segments(
+                    lane, lane_from, lane_to, upd_from, upd_to, card_from, card_to
+                )
+                if not segments:
+                    continue
+                for seg_idx, segment_item in enumerate(segments):
+                    segment = segment_item["lane"]
+                    if segment_item["kind"] == "update":
+                        apply_update_only_to_costs(segment, upd, base_rates_template)
+                    if seg_idx == 0:
+                        previous_records[idx] = segment
+                    else:
+                        previous_records.insert(idx + seg_idx, segment)
+                inserted_offset += len(segments) - 1
             else:
                 lane.setdefault("route", {})["update_note"] = "(updated)"
                 lane["route"]["update_source"] = "BASE"
