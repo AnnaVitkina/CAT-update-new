@@ -1,8 +1,21 @@
 import json
 import sys
-from copy import deepcopy
-from datetime import datetime, timedelta
+from collections import Counter
+from datetime import datetime
 from pathlib import Path
+
+from route_utils import (
+    should_skip_route_update,
+)
+from cost_utils import (
+    costs_same_family,
+    ensure_cost_container_type,
+    extract_container_from_cost_title,
+    migrate_cost_names_in_records,
+    normalize_container_code,
+    normalize_cost_title,
+    resolve_etsbaf_container,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -74,7 +87,7 @@ def not_performed_path_for(previous_json_path: Path):
 def map_container(raw):
     if not raw:
         return None
-    return str(raw).replace("CNTR", "")
+    return normalize_container_code(str(raw).replace("CNTR", ""))
 
 
 def map_charge(charge_code):
@@ -90,7 +103,7 @@ def target_cost_name(charge_code, container):
     charge = map_charge(charge_code)
     if not charge or not container:
         return None
-    return f"{charge} ({container})"
+    return normalize_cost_title(f"{charge} ({container})")
 
 
 def rate_by_for_container(container):
@@ -108,93 +121,233 @@ def full_cost_name(base_name, start_date, end_date):
     return f"{base_name[:-1]} {fmt(start_date)}-{fmt(end_date)})" if base_name.endswith(")") else base_name
 
 
-def find_matching_lanes(records, transporeon_id):
-    return [r for r in records if r.get("route", {}).get("Transporeon ID") == transporeon_id]
+def parse_validity_period(period_str):
+    if not period_str or "-" not in str(period_str):
+        return (None, None)
+    start_raw, end_raw = str(period_str).split("-", 1)
+    return parse_ddmmyyyy(start_raw.strip()), parse_ddmmyyyy(end_raw.strip())
 
 
-def update_or_create_cost_block(lane, update_rate, upd_from, upd_to):
+def periods_intersect(period_a_from, period_a_to, period_b_from, period_b_to):
+    if not all([period_a_from, period_a_to, period_b_from, period_b_to]):
+        return True
+    return not (period_a_to < period_b_from or period_a_from > period_b_to)
+
+
+def period_contains(outer_from, outer_to, inner_from, inner_to):
+    if not all([outer_from, outer_to, inner_from, inner_to]):
+        return False
+    return outer_from <= inner_from and outer_to >= inner_to
+
+
+def lane_validity(lane):
+    route = lane.get("route", {})
+    return parse_ddmmyyyy(route.get("Valid from")), parse_ddmmyyyy(route.get("Valid to"))
+
+
+def cost_validity(cost):
+    return parse_validity_period(cost.get("validity_period"))
+
+
+def family_blocks(rates, base_name):
+    return [c for c in rates if costs_same_family(c.get("cost_name"), base_name)]
+
+
+def resolve_template_validity(all_records, base_name, upd_from, upd_to, cache=None):
+    cache_key = (base_name, upd_from)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+
+    ends = Counter()
+    for rec in all_records:
+        for cost in rec.get("rates", []):
+            if not costs_same_family(cost.get("cost_name"), base_name):
+                continue
+            c_from, c_to = cost_validity(cost)
+            if c_from == upd_from and c_to:
+                ends[c_to] += 1
+    result = (upd_from, ends.most_common(1)[0][0]) if ends else (upd_from, upd_to)
+    if cache is not None:
+        cache[cache_key] = result
+    return result
+
+
+def lane_intersects_update(lane_from, lane_to, upd_from, upd_to):
+    if not all([lane_from, lane_to, upd_from, upd_to]):
+        return True
+    return periods_intersect(lane_from, lane_to, upd_from, upd_to)
+
+
+def equipment_size_class(container):
+    if not container:
+        return None
+    code = str(container)
+    if code.startswith(("42", "45", "52")):
+        return "40"
+    if code.startswith(("22", "25")):
+        return "20"
+    return code[:2]
+
+
+def sibling_has_rate_on_validity(lane, cost, container):
+    validity = cost.get("validity_period")
+    if not validity or not container:
+        return False
+    size_class = equipment_size_class(container)
+    charge_family = str(cost.get("cost_name", "")).split(" (", 1)[0]
+    for other in lane.get("rates", []):
+        if other is cost:
+            continue
+        if other.get("validity_period") != validity:
+            continue
+        if not str(other.get("cost_name", "")).startswith(charge_family):
+            continue
+        other_container = extract_container_from_cost_title(other.get("cost_name"))
+        if not other_container or other_container == container:
+            continue
+        if equipment_size_class(other_container) != size_class:
+            continue
+        if other.get("p_unit") is not None:
+            return True
+    return False
+
+
+def intersecting_blocks(family, upd_from, upd_to, lane_from, lane_to, lane):
+    matched = []
+    lane_overlaps_update = lane_intersects_update(lane_from, lane_to, upd_from, upd_to)
+    for cost in family:
+        ensure_cost_container_type(cost)
+        c_from, c_to = cost_validity(cost)
+        if c_from and c_to:
+            if lane_from and lane_to and not periods_intersect(lane_from, lane_to, c_from, c_to):
+                continue
+            if not periods_intersect(c_from, c_to, upd_from, upd_to):
+                continue
+            container = extract_container_from_cost_title(cost.get("cost_name"))
+            if not lane_overlaps_update and sibling_has_rate_on_validity(lane, cost, container):
+                continue
+            matched.append(cost)
+        elif not cost.get("validity_period"):
+            matched.append(cost)
+    return matched
+
+
+def apply_rate_to_block(cost, base_name, currency, rate, upd_from, upd_to, all_records, cache=None):
+    ensure_cost_container_type(cost)
+    if not cost.get("validity_period"):
+        block_from, block_to = resolve_template_validity(all_records, base_name, upd_from, upd_to, cache)
+        cost["validity_period"] = f"{fmt(block_from)}-{fmt(block_to)}"
+        cost["cost_name"] = full_cost_name(base_name, block_from, block_to)
+    cost["currency"] = currency
+    cost["p_unit"] = rate
+    cost["flat_min"] = None
+    if cost.get("update_note") != "(new)":
+        cost["update_note"] = "(updated)"
+
+
+def create_versioned_block(lane, base_name, container, update_rate, upd_from, upd_to, all_records, template=None, cache=None):
+    block_from, block_to = resolve_template_validity(all_records, base_name, upd_from, upd_to, cache)
+    source = template or {}
+    new_block = {
+        "cost_name": full_cost_name(base_name, block_from, block_to),
+        "container_type": container,
+        "apply_if": source.get("apply_if") or "Applies if invoiced by Carrier",
+        "validity_period": f"{fmt(block_from)}-{fmt(block_to)}",
+        "cost_to_prolong": source.get("cost_to_prolong"),
+        "rate_by": source.get("rate_by") or rate_by_for_container(container),
+        "rule": source.get("rule") or "Regular rule",
+        "currency": update_rate.get("currency"),
+        "flat_min": None,
+        "p_unit": update_rate.get("rate"),
+        "update_note": "(new)",
+    }
+    lane.setdefault("rates", []).append(new_block)
+    return new_block
+
+
+def cleanup_non_overlapping_etsbaf_values(lane):
+    lane_from, lane_to = lane_validity(lane)
+    if not (lane_from and lane_to):
+        return
+    for cost in lane.get("rates", []):
+        name = str(cost.get("cost_name", ""))
+        if not (name.startswith("BAF Fee") or name.startswith("EU ETS Fee")):
+            continue
+        c_from, c_to = cost_validity(cost)
+        if not all([c_from, c_to]):
+            continue
+        if periods_intersect(lane_from, lane_to, c_from, c_to):
+            continue
+        cost["currency"] = None
+        cost["p_unit"] = None
+        cost["flat_min"] = None
+        cost.pop("update_note", None)
+
+
+def find_matching_lanes(records, transporeon_id, rate_card_source_file):
+    lane_from, lane_to = lane_validity(lane)
+    if not (lane_from and lane_to):
+        return
+    for cost in lane.get("rates", []):
+        name = str(cost.get("cost_name", ""))
+        if not (name.startswith("BAF Fee") or name.startswith("EU ETS Fee")):
+            continue
+        c_from, c_to = cost_validity(cost)
+        if not all([c_from, c_to]):
+            continue
+        if periods_intersect(lane_from, lane_to, c_from, c_to):
+            continue
+        cost["currency"] = None
+        cost["p_unit"] = None
+        cost["flat_min"] = None
+        cost.pop("update_note", None)
+
+
+def find_matching_lanes(records, transporeon_id, rate_card_source_file):
+    lanes = [r for r in records if r.get("route", {}).get("Transporeon ID") == transporeon_id]
+    return [
+        lane
+        for lane in lanes
+        if not should_skip_route_update(lane.get("route", {}), rate_card_source_file)[0]
+    ]
+
+
+def update_or_create_cost_block(lane, update_rate, upd_from, upd_to, all_records, cache=None):
     container = map_container(update_rate.get("container_type"))
+    container = resolve_etsbaf_container(lane.get("rates", []), update_rate.get("charge_code"), container, target_cost_name)
     base_name = target_cost_name(update_rate.get("charge_code"), container)
     if not base_name:
-        return
+        return False
 
+    lane_from, lane_to = lane_validity(lane)
     rates = lane.get("rates", [])
-    candidates = [c for c in rates if c.get("cost_name", "").startswith(base_name[:-1])]
-    if not candidates:
-        # Create missing BAF/ETS block from scratch (empty->BASE->ETSBAF case).
-        target_validity = f"{fmt(upd_from)}-{fmt(upd_to)}"
-        new_block = {
-            "cost_name": full_cost_name(base_name, upd_from, upd_to),
-            "container_type": container,
-            "apply_if": "Applies if invoiced by Carrier",
-            "validity_period": target_validity,
-            "cost_to_prolong": None,
-            "rate_by": rate_by_for_container(container),
-            "rule": "Regular rule",
-            "currency": update_rate.get("currency"),
-            "flat_min": None,
-            "p_unit": update_rate.get("rate"),
-            "update_note": "(new)",
-        }
-        rates.append(new_block)
-        lane["rates"] = rates
-        return
+    family = family_blocks(rates, base_name)
+    targets = intersecting_blocks(family, upd_from, upd_to, lane_from, lane_to, lane)
+    if targets:
+        for target in targets:
+            apply_rate_to_block(
+                target,
+                base_name,
+                update_rate.get("currency"),
+                update_rate.get("rate"),
+                upd_from,
+                upd_to,
+                all_records,
+                cache,
+            )
+        return True
 
-    # Choose first matching family member as template.
-    template = candidates[0]
+    if lane_from and lane_to and not periods_intersect(lane_from, lane_to, upd_from, upd_to):
+        return False
 
-    # If existing has no validity, enrich it directly.
-    if not template.get("validity_period"):
-        template["validity_period"] = f"{fmt(upd_from)}-{fmt(upd_to)}"
-        template["cost_name"] = full_cost_name(base_name, upd_from, upd_to)
-        template["currency"] = update_rate.get("currency")
-        template["p_unit"] = update_rate.get("rate")
-        template["flat_min"] = None
-        template["update_note"] = "(updated)"
-        return
+    if lane_from and lane_to:
+        block_from, block_to = resolve_template_validity(all_records, base_name, upd_from, upd_to, cache)
+        if not periods_intersect(lane_from, lane_to, block_from, block_to):
+            return False
 
-    # Find latest block of this cost family to split/version.
-    family = [c for c in rates if c.get("cost_name", "").startswith(base_name[:-1])]
-
-    target_validity = f"{fmt(upd_from)}-{fmt(upd_to)}"
-    # If this exact validity already exists, update it in place (no duplicate block).
-    same_validity = next((c for c in family if c.get("validity_period") == target_validity), None)
-    if same_validity is not None:
-        same_validity["cost_name"] = full_cost_name(base_name, upd_from, upd_to)
-        same_validity["currency"] = update_rate.get("currency")
-        same_validity["flat_min"] = None
-        same_validity["p_unit"] = update_rate.get("rate")
-        same_validity["update_note"] = "(updated)"
-        lane["rates"] = rates
-        return
-
-    latest = family[-1]
-    prev_validity = latest.get("validity_period")
-    prev_from = None
-    prev_to = None
-    if isinstance(prev_validity, str) and "-" in prev_validity:
-        a, b = prev_validity.split("-", 1)
-        prev_from = parse_ddmmyyyy(a.strip())
-        prev_to = parse_ddmmyyyy(b.strip())
-
-    if prev_from and prev_to and upd_from > prev_from:
-        trimmed_to = upd_from - timedelta(days=1)
-        latest["validity_period"] = f"{fmt(prev_from)}-{fmt(trimmed_to)}"
-        latest["cost_name"] = full_cost_name(base_name, prev_from, trimmed_to)
-        latest["update_note"] = "(updated)"
-
-    new_block = deepcopy(latest)
-    new_block["cost_name"] = base_name
-    new_block["validity_period"] = target_validity
-    new_block["cost_to_prolong"] = latest.get("cost_name")
-    new_block["currency"] = update_rate.get("currency")
-    new_block["flat_min"] = None
-    new_block["p_unit"] = update_rate.get("rate")
-    new_block["update_note"] = "(new)"
-    new_block["cost_name"] = full_cost_name(base_name, upd_from, upd_to)
-    insert_idx = rates.index(latest) + 1
-    rates.insert(insert_idx, new_block)
-    lane["rates"] = rates
+    template = family[-1] if family else None
+    create_versioned_block(lane, base_name, container, update_rate, upd_from, upd_to, all_records, template, cache)
+    return True
 
 
 def container_sort_key(container_value):
@@ -346,7 +499,7 @@ def dedupe_same_validity_costs(lane):
     # Keep deterministic order by scanning left-to-right.
     for idx, cost in enumerate(rates):
         family = family_of(cost.get("cost_name"))
-        container = str(cost.get("container_type") or "")
+        container = str(cost.get("container_type") or extract_container_from_cost_title(cost.get("cost_name")) or "")
         validity = str(cost.get("validity_period") or "")
         if family is None or not container or not validity:
             continue
@@ -382,7 +535,7 @@ def dedupe_same_validity_costs(lane):
     for idx, cost in enumerate(rates):
         family = str(cost.get("cost_name") or "")
         if family.startswith("BAF Fee") or family.startswith("EU ETS Fee"):
-            container = str(cost.get("container_type") or "")
+            container = str(cost.get("container_type") or extract_container_from_cost_title(cost.get("cost_name")) or "")
             validity = str(cost.get("validity_period") or "")
             if container and validity:
                 if idx not in keep_idxs:
@@ -417,10 +570,18 @@ def main():
     previous = json.loads(previous_json.read_text(encoding="utf-8"))
     updates = json.loads(rate_update_json.read_text(encoding="utf-8"))
     records = previous.get("records", [])
+    migrate_cost_names_in_records(records)
 
     etsbaf_updates = [r for r in updates.get("records", []) if r.get("sheet_name") == "ETSBAF"]
     if not etsbaf_updates:
         raise ValueError("No ETSBAF updates found in selected rate update JSON.")
+
+    rate_card_source = previous.get("source_file")
+    etsbaf_updates = [
+        upd
+        for upd in etsbaf_updates
+        if not should_skip_route_update(upd.get("route", {}), rate_card_source)[0]
+    ]
 
     not_performed = []
 
@@ -431,6 +592,8 @@ def main():
             str(r.get("route", {}).get("RATE_EFFECTIVE_DATE__C", "")),
         )
     )
+
+    validity_cache = {}
 
     for upd in etsbaf_updates:
         route = upd.get("route", {})
@@ -443,7 +606,7 @@ def main():
         if not (upd_from and upd_to):
             continue
 
-        lanes = find_matching_lanes(records, tid)
+        lanes = find_matching_lanes(records, tid, rate_card_source)
         if not lanes:
             not_performed.append(
                 {
@@ -458,16 +621,18 @@ def main():
             for ur in upd.get("rates", []):
                 if str(ur.get("charge_code", "")).lower() not in {"baf", "ets"}:
                     continue
-                update_or_create_cost_block(lane, ur, upd_from, upd_to)
+                update_or_create_cost_block(lane, ur, upd_from, upd_to, records, validity_cache)
             remove_empty_updated_blocks(lane)
             cleanup_replaced_plain_costs(lane)
             dedupe_same_validity_costs(lane)
+            cleanup_non_overlapping_etsbaf_values(lane)
             reorder_etsbaf_costs(lane)
 
     previous["records"] = records
     for lane in previous["records"]:
         remove_empty_updated_blocks(lane)
         dedupe_same_validity_costs(lane)
+        cleanup_non_overlapping_etsbaf_values(lane)
     cleanup_plain_stubs_globally(previous["records"])
     previous["record_count"] = len(records)
     previous["update_context"] = {
