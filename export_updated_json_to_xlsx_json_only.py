@@ -7,6 +7,14 @@ from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 
+from cost_utils import METRIC_ORDER, migrate_cost_names_in_records, normalize_cost_title
+
+LEGACY_FLAT_COLUMN_COSTS = {
+    "Base Rate (BASE_STAT_FRK)",
+    "RoRo Fee",
+    "Documentation Fee",
+}
+
 
 ROOT = Path(__file__).resolve().parent
 PROCESSING_DIR = ROOT / "processing"
@@ -206,18 +214,36 @@ def collect_cost_meta(records, payload):
     return meta
 
 
-def should_show_flat_column(cost_name):
-    name = str(cost_name)
-    return name == "Base Rate (BASE_STAT_FRK)" or name == "RoRo Fee"
+def resolve_cost_metrics(records, cost_name):
+    metrics = set()
+    has_flat_value = False
+    has_punit_value = False
+    for rec in records:
+        for rate in rec.get("rates", []):
+            if normalize_cost_title(rate.get("cost_name")) != cost_name:
+                continue
+            if rate.get("metrics"):
+                metrics.update(rate["metrics"])
+            if rate.get("flat_min") is not None:
+                has_flat_value = True
+            if rate.get("p_unit") is not None:
+                has_punit_value = True
+    if metrics:
+        return [m for m in METRIC_ORDER if m in metrics]
+    if cost_name in LEGACY_FLAT_COLUMN_COSTS:
+        return ["currency", "flat_min", "p_unit"]
+    resolved = ["currency"]
+    if has_flat_value:
+        resolved.append("flat_min")
+    if has_punit_value:
+        resolved.append("p_unit")
+    return resolved if len(resolved) > 1 else ["currency", "p_unit"]
 
 
 def collect_cost_metrics(records, cost_names):
     metrics = {}
     for cost_name in cost_names:
-        if should_show_flat_column(cost_name):
-            metrics[cost_name] = ["currency", "flat_min", "p_unit"]
-        else:
-            metrics[cost_name] = ["currency", "p_unit"]
+        metrics[cost_name] = resolve_cost_metrics(records, cost_name)
     return metrics
 
 
@@ -321,9 +347,7 @@ def write_records(ws, records, route_keys, cost_names, cost_metrics, payload):
             base_col = cost_start_col[name]
             metric_keys = cost_metrics[name]
             for offset, metric_key in enumerate(metric_keys):
-                # Layout rule: keep Flat (MIN) column but never populate values.
-                value = None if metric_key == "flat_min" else rate.get(metric_key)
-                ws.cell(row, base_col + offset, value)
+                ws.cell(row, base_col + offset, rate.get(metric_key))
             if rate.get("update_note") in {"(new)", "(updated)"}:
                 for offset in range(len(metric_keys)):
                     ws.cell(row, base_col + offset).fill = GREEN_FILL
@@ -333,6 +357,7 @@ def main():
     json_path = choose_updated_json()
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     records = payload.get("records", [])
+    migrate_cost_names_in_records(records)
     if not records:
         raise ValueError("No records found in updated JSON.")
 
