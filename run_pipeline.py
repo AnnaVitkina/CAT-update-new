@@ -20,13 +20,13 @@ def resolve_code_root():
 ROOT = resolve_code_root()
 
 INPUT_STORAGE = Path(
-    "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT_CAT/RMT_CAT_update/input"
+    "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT_CAT_update/input"
 )
 PROCESSING_STORAGE = Path(
-    "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT_CAT/RMT_CAT_update/processing"
+    "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT_CAT_update/processing"
 )
 OUTPUT_STORAGE = Path(
-    "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT_CAT/RMT_CAT_update/output"
+    "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT_CAT_update/output"
 )
 
 INPUT_DIR = ROOT / "input"
