@@ -6,6 +6,8 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
+from cost_utils import normalize_container_code
+
 
 ROOT = Path(__file__).resolve().parent
 INPUT_DIR = ROOT / "input" / "rate updates"
@@ -152,7 +154,7 @@ def parse_file(file_path: Path):
                 if not match:
                     continue
 
-                container = match.group("container")
+                container = normalize_container_code(match.group("container"))
                 charge = match.group("charge").lower()
                 metric = match.group("metric").lower()
 
