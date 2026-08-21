@@ -4,20 +4,16 @@ from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from route_utils import (
+    map_update_route_to_rate_card_fields,
+    should_skip_route_update,
+    trim_service,
+)
+from cost_utils import merge_metrics, migrate_cost_names_in_records, normalize_container_code, normalize_cost_title
+
 
 ROOT = Path(__file__).resolve().parent
 PROCESSING_DIR = ROOT / "processing"
-
-def trim_service(service_value):
-    service = "" if service_value is None else str(service_value)
-    if service.startswith("OC_CNTR_"):
-        service = service[len("OC_CNTR_") :]
-    elif service.startswith("OC_CNTTR_"):
-        service = service[len("OC_CNTTR_") :]
-    if service.endswith("_BU"):
-        service = service[: -len("_BU")]
-    return service
-
 
 def to_ddmmyyyy(value):
     if not value:
@@ -117,8 +113,8 @@ def filter_bu_service_conflicts(update_records):
 def map_container_type(update_container_type):
     if not update_container_type:
         return None
-    raw = str(update_container_type)
-    return raw.replace("CNTR", "")
+    raw = str(update_container_type).replace("CNTR", "")
+    return normalize_container_code(raw)
 
 
 def map_charge_name(charge_code):
@@ -129,13 +125,42 @@ def map_charge_name(charge_code):
         "dthc": "Destination Terminal Handling Fee",
         "othc": "Origin Terminal Handling Fee",
         "wrf": "War Risk Fee",
+        "dcfs": "Destination CFS Fee",
     }
     return mapping.get(str(charge_code).lower(), str(charge_code).upper())
 
 
 def should_ignore_min(charge_code, container_type):
-    # Ignore MIN for containerized Base Rate updates.
-    return str(charge_code).lower() == "base" and container_type not in (None, "", "None")
+    # Ignore MIN only for containerized Base Rate updates (e.g. 22G0, 42G0).
+    if str(charge_code).lower() != "base":
+        return False
+    if container_type in (None, "", "None"):
+        return False
+    if str(container_type) == "BASE_STAT_FRK":
+        return False
+    return True
+
+
+def find_cost_target(lane_costs, index, candidate_name, container):
+    candidate_name = normalize_cost_title(candidate_name)
+    key = (candidate_name, str(container))
+    if key in index:
+        return lane_costs[index[key]], key
+
+    none_key = (candidate_name, "None")
+    if none_key in index:
+        return lane_costs[index[none_key]], none_key
+
+    name_matches = [
+        i
+        for i, c in enumerate(lane_costs)
+        if normalize_cost_title(c.get("cost_name")) == candidate_name
+    ]
+    if len(name_matches) == 1:
+        matched_key = (candidate_name, str(lane_costs[name_matches[0]].get("container_type")))
+        return lane_costs[name_matches[0]], matched_key
+
+    return None, key
 
 
 def map_rate_by(container_type):
@@ -152,8 +177,8 @@ def map_rate_by(container_type):
 def build_cost_name(charge_code, container_type):
     base_name = map_charge_name(charge_code)
     if container_type:
-        return f"{base_name} ({container_type})"
-    return base_name
+        return normalize_cost_title(f"{base_name} ({container_type})")
+    return normalize_cost_title(base_name)
 
 
 def make_base_cost_template(cost):
@@ -168,8 +193,8 @@ def make_base_cost_template(cost):
     return template
 
 
-def make_new_cost(charge_code, container_type):
-    return {
+def make_new_cost(charge_code, container_type, template_cost=None):
+    cost = {
         "cost_name": build_cost_name(charge_code, container_type),
         "container_type": container_type,
         "apply_if": "Applies if invoiced by Carrier",
@@ -180,7 +205,11 @@ def make_new_cost(charge_code, container_type):
         "currency": None,
         "flat_min": None,
         "p_unit": None,
+        "metrics": ["currency", "p_unit"],
     }
+    if template_cost and template_cost.get("metrics"):
+        cost["metrics"] = list(template_cost["metrics"])
+    return cost
 
 
 def get_lane_template(previous_records):
@@ -224,11 +253,17 @@ def update_costs(base_rates_template, lane_record, update_record):
         candidate_name = build_cost_name(charge_code, container)
         lookup_key = (candidate_name, str(container))
 
-        if lookup_key in index:
-            target = lane_costs[index[lookup_key]]
+        target, matched_key = find_cost_target(lane_costs, index, candidate_name, container)
+        if target is not None:
             is_new_cost = False
+            lookup_key = matched_key
         else:
-            target = make_new_cost(charge_code, container)
+            template_cost = None
+            for c in base_rates_template:
+                if c.get("cost_name") == candidate_name:
+                    template_cost = c
+                    break
+            target = make_new_cost(charge_code, container, template_cost)
             target["update_note"] = "(new)"
             lane_costs.append(target)
             index[lookup_key] = len(lane_costs) - 1
@@ -259,20 +294,21 @@ def apply_update_only_to_costs(lane_record, update_record, base_rates_template):
         charge_code = upd.get("charge_code")
         container = map_container_type(upd.get("container_type"))
         candidate_name = build_cost_name(charge_code, container)
-        key = (candidate_name, str(container))
 
-        if key in index:
-            target = lane_costs[index[key]]
-        else:
-            target = make_new_cost(charge_code, container)
+        target, _matched_key = find_cost_target(lane_costs, index, candidate_name, container)
+        if target is None:
+            template_cost = next((c for c in base_rates_template if c.get("cost_name") == candidate_name), None)
+            target = make_new_cost(charge_code, container, template_cost)
             target["update_note"] = "(new)"
-            insert_at = template_index.get(key, len(lane_costs))
-            lane_costs.insert(insert_at, target)
+            insert_at = template_index.get((candidate_name, str(container)))
+            if insert_at is None:
+                insert_at = template_index.get((candidate_name, "None"), len(lane_costs))
+            lane_costs.insert(min(insert_at, len(lane_costs)), target)
             index = {
                 (str(c.get("cost_name")), str(c.get("container_type"))): i
                 for i, c in enumerate(lane_costs)
             }
-            target = lane_costs[index[key]]
+            target, _ = find_cost_target(lane_costs, index, candidate_name, container)
 
         target["currency"] = upd.get("currency")
         target["flat_min"] = None if should_ignore_min(charge_code, container) else upd.get("min")
@@ -291,6 +327,7 @@ def build_new_lane(update_record, previous_records, base_rates_template, card_fr
     if not (eff_from and eff_to):
         return None
 
+    location_fields = map_update_route_to_rate_card_fields(route)
     lane = {
         "row_number": next_row_number(previous_records),
         "route": {
@@ -299,13 +336,15 @@ def build_new_lane(update_record, previous_records, base_rates_template, card_fr
             "KEY": route.get("KEY"),
             "Carrier": route.get("CARRIER"),
             "SERVICE": "not PRECARRIAGE/ONCARRIAGE",
-            "SERVICE_C": route.get("SERVICE__C"),
+            "SERVICE__C": route.get("SERVICE__C"),
             "Service": trim_service(route.get("SERVICE__C")),
             "Valid from": format_ddmmyyyy(eff_from),
             "Valid to": format_ddmmyyyy(eff_to),
-            "Origin Port": route.get("ORIGIN_LOCATION_NAME__C"),
+            "Origin Port": location_fields["Origin Port"],
+            "Origin Postal Code": location_fields["Origin Postal Code"],
             "ORIGIN_COUNTRY__C": route.get("ORIGIN_COUNTRY__C"),
-            "Destination Port": route.get("DESTINATION_LOCATION_NAME__C"),
+            "Destination Port": location_fields["Destination Port"],
+            "Destination Postal Code": location_fields["Destination Postal Code"],
             "DESTINATION_COUNTRY__C": route.get("DESTINATION_COUNTRY__C"),
             "update_note": "(new)",
             "update_source": "BASE",
@@ -471,10 +510,17 @@ def main():
     updates = json.loads(rate_update_json.read_text(encoding="utf-8"))
 
     previous_records = previous.get("records", [])
+    migrate_cost_names_in_records(previous_records)
     update_records = [r for r in updates.get("records", []) if r.get("sheet_name") == "BASE"]
     if not update_records:
         raise ValueError("No BASE records found in rate update file.")
     update_records = filter_bu_service_conflicts(update_records)
+    rate_card_source = previous.get("source_file")
+    update_records = [
+        upd
+        for upd in update_records
+        if not should_skip_route_update(upd.get("route", {}), rate_card_source)[0]
+    ]
 
     template_record = get_lane_template(previous_records) if previous_records else {"rates": []}
     base_rates_template = template_record.get("rates", [])
@@ -492,7 +538,10 @@ def main():
             if not validity_ranges_intersect(upd_from, upd_to, card_from, card_to):
                 continue
         matching_idxs = [
-            i for i, rec in enumerate(previous_records) if rec.get("route", {}).get("Transporeon ID") == tid
+            i
+            for i, rec in enumerate(previous_records)
+            if rec.get("route", {}).get("Transporeon ID") == tid
+            and not should_skip_route_update(rec.get("route", {}), rate_card_source)[0]
         ]
 
         if not matching_idxs:
@@ -502,6 +551,7 @@ def main():
             continue
 
         inserted_offset = 0
+        applied = False
         for base_idx in matching_idxs:
             idx = base_idx + inserted_offset
             lane = previous_records[idx]
@@ -519,6 +569,7 @@ def main():
                 )
                 if not segments:
                     continue
+                applied = True
                 for seg_idx, segment_item in enumerate(segments):
                     segment = segment_item["lane"]
                     if segment_item["kind"] == "update":
@@ -529,9 +580,15 @@ def main():
                         previous_records.insert(idx + seg_idx, segment)
                 inserted_offset += len(segments) - 1
             else:
+                applied = True
                 lane.setdefault("route", {})["update_note"] = "(updated)"
                 lane["route"]["update_source"] = "BASE"
                 apply_update_only_to_costs(lane, upd, base_rates_template)
+
+        if not applied:
+            new_lane = build_new_lane(upd, previous_records, base_rates_template, card_from, card_to)
+            if new_lane is not None:
+                previous_records.append(new_lane)
 
     renumber_rows_and_lanes(previous_records)
 
