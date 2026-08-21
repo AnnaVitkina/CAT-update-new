@@ -6,6 +6,8 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
+from cost_utils import extract_container_from_cost_title, merge_metrics, normalize_cost_title, sort_metrics
+
 
 ROOT = Path(__file__).resolve().parent
 INPUT_DIR = ROOT / "input" / "previous rate card"
@@ -47,14 +49,7 @@ def normalize_charge_code(title: str):
 
 
 def extract_container_type(title: str):
-    match = re.search(r"\(([^)]*)\)", title or "")
-    if not match:
-        return None
-    inside = match.group(1).strip()
-    container_match = re.search(r"\b([0-9]{2}G[0-9A-Z])\b", inside)
-    if container_match:
-        return container_match.group(1)
-    return None
+    return extract_container_from_cost_title(normalize_cost_title(title))
 
 
 def normalize_field_name(name: str):
@@ -187,11 +182,19 @@ def collect_route_columns(data_header):
     return route_columns
 
 
-def key_column_index(route_columns):
-    for col_idx, label in route_columns:
-        if label == "KEY":
-            return col_idx
-    return 2
+def has_lane_identifiers(route):
+    for field in (
+        "Lane #",
+        "Transporeon ID",
+        "KEY",
+        "Carrier",
+        "Origin Port",
+        "Destination Port",
+    ):
+        value = route.get(field)
+        if value not in (None, ""):
+            return True
+    return False
 
 
 def parse_file(file_path: Path):
@@ -208,7 +211,6 @@ def parse_file(file_path: Path):
     header_idx = find_header_row(rows)
     data_header = rows[header_idx]
     route_columns = collect_route_columns(data_header)
-    key_col = key_column_index(route_columns)
     charge_title_row = rows[header_idx - 4] if header_idx >= 4 else tuple([None] * len(data_header))
     apply_if_row = rows[header_idx - 3] if header_idx >= 3 else tuple([None] * len(data_header))
     rate_by_row = rows[header_idx - 2] if header_idx >= 2 else tuple([None] * len(data_header))
@@ -223,10 +225,11 @@ def parse_file(file_path: Path):
         if metric_label not in {"Currency", "Flat", "p/unit"}:
             continue
         if charge_title:
-            current_charge_title = charge_title
+            current_charge_title = normalize_cost_title(charge_title)
         if not current_charge_title:
             continue
 
+        normalized_title = normalize_cost_title(current_charge_title)
         metric = "currency" if metric_label == "Currency" else ("min" if metric_label == "Flat" else "rate")
         apply_if_text = clean_text(apply_if_row[col_idx]) if col_idx < len(apply_if_row) else None
         rate_by_text = clean_text(rate_by_row[col_idx]) if col_idx < len(rate_by_row) else None
@@ -239,9 +242,9 @@ def parse_file(file_path: Path):
             or rule_text
         )
         charges_by_column[col_idx] = {
-            "charge_code": normalize_charge_code(current_charge_title),
-            "container_type": extract_container_type(current_charge_title),
-            "cost_name": current_charge_title,
+            "charge_code": normalize_charge_code(normalized_title),
+            "container_type": extract_container_type(normalized_title),
+            "cost_name": normalized_title,
             "metric": metric,
             "apply_if": extract_from_text(r"(Applies if[^\n]+)", apply_if_text),
             "validity_period": normalize_validity_period(
@@ -252,12 +255,22 @@ def parse_file(file_path: Path):
             "rule": rule_value,
         }
         cost_key = (
-            current_charge_title,
-            extract_container_type(current_charge_title),
-            normalize_charge_code(current_charge_title),
+            normalized_title,
+            extract_container_type(normalized_title),
+            normalize_charge_code(normalized_title),
         )
         if cost_key not in ordered_cost_keys:
             ordered_cost_keys.append(cost_key)
+
+    cost_metrics_by_key = {}
+    for spec in charges_by_column.values():
+        key = (spec["cost_name"], spec["container_type"], spec["charge_code"])
+        metric_field = (
+            "currency"
+            if spec["metric"] == "currency"
+            else ("flat_min" if spec["metric"] == "min" else "p_unit")
+        )
+        cost_metrics_by_key.setdefault(key, set()).add(metric_field)
 
     records = []
     for row_idx in range(header_idx + 1, len(rows)):
@@ -265,13 +278,12 @@ def parse_file(file_path: Path):
         if all(cell is None or cell == "" for cell in row):
             continue
 
-        key = to_primitive(row[key_col]) if len(row) > key_col else None
-        if key in (None, ""):
-            continue
-
         route = {}
         for col_idx, label in route_columns:
             route[label] = to_primitive(row[col_idx]) if col_idx < len(row) else None
+
+        if not has_lane_identifiers(route):
+            continue
 
         record = {
             "row_number": row_idx + 1,
@@ -298,12 +310,13 @@ def parse_file(file_path: Path):
                     "container_type": matching_spec["container_type"],
                     "apply_if": matching_spec["apply_if"],
                     "validity_period": matching_spec["validity_period"],
-                    "cost_to_prolong": matching_spec["cost_to_prolong"],
+                    "cost_to_prolong": normalize_cost_title(matching_spec["cost_to_prolong"]),
                     "rate_by": matching_spec["rate_by"],
                     "rule": matching_spec["rule"],
                     "currency": None,
                     "flat_min": None,
                     "p_unit": None,
+                    "metrics": sort_metrics(cost_metrics_by_key.get(group_key, {"currency", "p_unit"})),
                 }
 
         for col_idx, spec in charges_by_column.items():
