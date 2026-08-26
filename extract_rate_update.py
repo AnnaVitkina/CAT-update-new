@@ -9,9 +9,10 @@ from openpyxl import load_workbook
 from cost_utils import normalize_container_code
 
 
-ROOT = Path(__file__).resolve().parent
-INPUT_DIR = ROOT / "input" / "rate updates"
-OUTPUT_DIR = ROOT / "processing"
+from paths import INPUT_UPDATE_DIR, PROCESSING_DIR
+
+INPUT_DIR = INPUT_UPDATE_DIR
+OUTPUT_DIR = PROCESSING_DIR
 
 
 COMMON_FIELDS = [
