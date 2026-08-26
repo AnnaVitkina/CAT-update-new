@@ -16,9 +16,7 @@ LEGACY_FLAT_COLUMN_COSTS = {
 }
 
 
-ROOT = Path(__file__).resolve().parent
-PROCESSING_DIR = ROOT / "processing"
-OUTPUT_DIR = ROOT / "output"
+from paths import OUTPUT_DIR, PROCESSING_DIR
 
 TITLE_ROW = 1
 SUBTITLE_ROW = 2
