@@ -18,8 +18,7 @@ from cost_utils import (
 )
 
 
-ROOT = Path(__file__).resolve().parent
-PROCESSING_DIR = ROOT / "processing"
+from paths import PROCESSING_DIR
 
 
 def parse_ddmmyyyy(value):
