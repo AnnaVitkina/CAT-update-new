@@ -9,9 +9,10 @@ from openpyxl import load_workbook
 from cost_utils import extract_container_from_cost_title, merge_metrics, normalize_cost_title, sort_metrics
 
 
-ROOT = Path(__file__).resolve().parent
-INPUT_DIR = ROOT / "input" / "previous rate card"
-OUTPUT_DIR = ROOT / "processing"
+from paths import INPUT_PREVIOUS_DIR, PROCESSING_DIR
+
+INPUT_DIR = INPUT_PREVIOUS_DIR
+OUTPUT_DIR = PROCESSING_DIR
 TARGET_SHEET = "Rate card"
 
 
