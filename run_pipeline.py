@@ -5,35 +5,31 @@ import sys
 from pathlib import Path
 
 
-def resolve_code_root():
-    # Supports execution via `exec(open(...).read())` in Colab where __file__ may be missing.
+def bootstrap_code_root():
     if "__file__" in globals():
-        return Path(__file__).resolve().parent
+        root = Path(__file__).resolve().parent
+    else:
+        colab_root = Path("/content/CAT-update-new")
+        root = colab_root if colab_root.exists() else Path.cwd()
 
-    colab_root = Path("/content/CAT-update-new")
-    if colab_root.exists():
-        return colab_root
+    root_str = str(root)
+    if root_str not in sys.path:
+        sys.path.insert(0, root_str)
+    return root
 
-    return Path.cwd()
 
+CODE_ROOT = bootstrap_code_root()
 
-ROOT = resolve_code_root()
-
-INPUT_STORAGE = Path(
-    "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT_CAT_update/input"
+from paths import (  # noqa: E402
+    INPUT_PREVIOUS_DIR,
+    INPUT_STORAGE,
+    INPUT_UPDATE_DIR,
+    OUTPUT_DIR,
+    OUTPUT_STORAGE,
+    PROCESSING_DIR,
+    PROCESSING_STORAGE,
+    ensure_storage_dirs,
 )
-PROCESSING_STORAGE = Path(
-    "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT_CAT_update/processing"
-)
-OUTPUT_STORAGE = Path(
-    "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team /Documents/AI Adoption RMT/RMT_CAT_update/output"
-)
-
-INPUT_DIR = ROOT / "input"
-PROCESSING_DIR = ROOT / "processing"
-OUTPUT_DIR = ROOT / "output"
-INPUT_PREVIOUS_DIR = INPUT_DIR / "previous rate card"
-INPUT_UPDATE_DIR = INPUT_DIR / "rate updates"
 
 
 def choose_file(files, prompt, cli_arg_index):
@@ -70,40 +66,13 @@ def choose_file(files, prompt, cli_arg_index):
 
 
 def run_py(script_name, *args):
-    cmd = [sys.executable, str(ROOT / script_name), *args]
+    cmd = [sys.executable, str(CODE_ROOT / script_name), *args]
     env = os.environ.copy()
-    env["CAT_CODE_ROOT"] = str(ROOT)
+    env["CAT_CODE_ROOT"] = str(CODE_ROOT)
     env["CAT_INPUT_STORAGE"] = str(INPUT_STORAGE)
     env["CAT_PROCESSING_STORAGE"] = str(PROCESSING_STORAGE)
     env["CAT_OUTPUT_STORAGE"] = str(OUTPUT_STORAGE)
-    subprocess.run(cmd, check=True, cwd=ROOT, env=env)
-
-
-def ensure_storage_symlink(local_path: Path, target_path: Path):
-    target_path.mkdir(parents=True, exist_ok=True)
-
-    if local_path.exists() or local_path.is_symlink():
-        try:
-            if local_path.resolve() == target_path.resolve():
-                return
-        except Exception:
-            pass
-        raise RuntimeError(
-            f"{local_path} already exists and is not linked to {target_path}. "
-            f"Please remove or relink it before running pipeline."
-        )
-
-    local_path.parent.mkdir(parents=True, exist_ok=True)
-    local_path.symlink_to(target_path, target_is_directory=True)
-
-
-def setup_storage_paths():
-    # On Colab/Linux: wire local project folders to Google Drive storage via symlink,
-    # so existing scripts keep working with their project-relative paths.
-    if os.name != "nt":
-        ensure_storage_symlink(INPUT_DIR, INPUT_STORAGE)
-        ensure_storage_symlink(PROCESSING_DIR, PROCESSING_STORAGE)
-        ensure_storage_symlink(OUTPUT_DIR, OUTPUT_STORAGE)
+    subprocess.run(cmd, check=True, cwd=CODE_ROOT, env=env)
 
 
 def main():
@@ -165,7 +134,7 @@ def main():
     final_xlsx = OUTPUT_DIR / f"{final_json.stem}.xlsx"
 
     print("\nPipeline completed.")
-    print(f"Code root: {ROOT}")
+    print(f"Code root: {CODE_ROOT}")
     print(f"Input storage: {INPUT_STORAGE}")
     print(f"Processing storage: {PROCESSING_STORAGE}")
     print(f"Output storage: {OUTPUT_STORAGE}")
@@ -180,5 +149,5 @@ def main():
 
 
 if __name__ == "__main__":
-    setup_storage_paths()
+    ensure_storage_dirs()
     main()
