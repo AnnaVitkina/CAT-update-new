@@ -18,11 +18,13 @@ def normalize_cost_title(title):
 
 
 CONTAINER_ALIASES = {
-    "22UT": "22UTH",
+    "22SOC": "22G0",
+    "42P1S": "42G0",
 }
 
 ETSBAF_CONTAINER_FALLBACKS = {
     "42P1S": "42G0",
+    "22SOC": "22G0",
 }
 
 
@@ -81,12 +83,12 @@ def resolve_etsbaf_container(lane_rates, charge_code, container, target_cost_nam
 def ensure_cost_container_type(cost):
     if not cost:
         return
+    from_name = extract_container_from_cost_title(cost.get("cost_name"))
+    if from_name:
+        cost["container_type"] = from_name
+        return
     if cost.get("container_type"):
         cost["container_type"] = normalize_container_code(cost.get("container_type"))
-        return
-    container = extract_container_from_cost_title(cost.get("cost_name"))
-    if container:
-        cost["container_type"] = container
 
 
 def sort_metrics(metrics):
