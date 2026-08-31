@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from route_utils import (
+    is_bu_key_lane,
     map_update_route_to_rate_card_fields,
     should_skip_route_update,
     trim_service,
@@ -85,8 +86,63 @@ def is_bu_related_update(update_record):
     service = route.get("SERVICE__C")
     if is_bu_related_service(service):
         return True
-    key = str(route.get("KEY") or "")
-    return "_CY-CY_BU-" in key or "_CY-CY_BU_" in key
+    return is_bu_key_lane(route.get("KEY"))
+
+
+def update_validity_period(update_record):
+    route = update_record.get("route", {})
+    return (
+        parse_yyyymmdd(route.get("RATE_EFFECTIVE_DATE__C")),
+        parse_yyyymmdd(route.get("RATE_EXPIRATION_DATE__C")),
+    )
+
+
+def get_normalized_base_rate_signature(update_record):
+    for rate in update_record.get("rates", []):
+        if str(rate.get("charge_code")).lower() != "base":
+            continue
+        container = map_container_type(rate.get("container_type"))
+        if container != "22G0":
+            continue
+        return (
+            rate.get("currency"),
+            rate.get("min"),
+            rate.get("rate"),
+        )
+    return None
+
+
+def filter_container_alias_conflicts(update_records):
+    grouped = {}
+    for rec in update_records:
+        tid = rec.get("route", {}).get("Transporeon ID") or ""
+        grouped.setdefault(tid, []).append(rec)
+
+    drop_ids = set()
+    for group in grouped.values():
+        if len(group) < 2:
+            continue
+        for idx, rec_a in enumerate(group):
+            base_a = get_normalized_base_rate_signature(rec_a)
+            if base_a is None:
+                continue
+            from_a, to_a = update_validity_period(rec_a)
+            if not (from_a and to_a):
+                continue
+            for rec_b in group[idx + 1 :]:
+                base_b = get_normalized_base_rate_signature(rec_b)
+                if base_b is None or base_a == base_b:
+                    continue
+                from_b, to_b = update_validity_period(rec_b)
+                if not (from_b and to_b):
+                    continue
+                if not validity_ranges_intersect(from_a, to_a, from_b, to_b):
+                    continue
+                for rec in (rec_a, rec_b):
+                    if is_bu_key_lane(rec.get("route", {}).get("KEY")):
+                        drop_ids.add(id(rec))
+
+    return [rec for rec in update_records if id(rec) not in drop_ids]
 
 
 def filter_bu_service_conflicts(update_records):
@@ -514,6 +570,7 @@ def main():
     if not update_records:
         raise ValueError("No BASE records found in rate update file.")
     update_records = filter_bu_service_conflicts(update_records)
+    update_records = filter_container_alias_conflicts(update_records)
     rate_card_source = previous.get("source_file")
     update_records = [
         upd
