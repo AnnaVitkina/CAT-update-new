@@ -7,7 +7,7 @@ from pathlib import Path
 from openpyxl import load_workbook
 
 from cost_utils import normalize_container_code
-
+from route_utils import build_transporeon_id, should_skip_rate_update_route
 
 from paths import INPUT_UPDATE_DIR, PROCESSING_DIR
 
@@ -39,6 +39,11 @@ RATE_COL_RE = re.compile(
     r"^(?P<container>[0-9A-Z]+)_(?P<charge>[A-Z]+)_(?P<metric>CURRENCY|MIN|RATE)$"
 )
 
+IGNORED_RATE_COLUMNS = {
+    "DFTBASE_SLF_PRP_CURRENCY",
+    "DFTBASE_SLF_PRP_RATE",
+}
+
 
 def to_primitive(value):
     if value is None:
@@ -55,35 +60,6 @@ def safe_float(value):
         return float(value)
     except (TypeError, ValueError):
         return None
-
-
-def trim_service_for_transporeon(service_value):
-    if service_value is None:
-        return ""
-    service = str(service_value)
-    if service.startswith("OC_CNTR_"):
-        service = service[len("OC_CNTR_") :]
-    elif service.startswith("OC_CNTTR_"):
-        service = service[len("OC_CNTTR_") :]
-    if service.endswith("_BU"):
-        service = service[: -len("_BU")]
-    return service
-
-
-def build_transporeon_id(row_map):
-    carrier_code = "" if row_map.get("CARRIER") is None else str(row_map.get("CARRIER"))
-    service = trim_service_for_transporeon(row_map.get("SERVICE__C"))
-    origin = (
-        ""
-        if row_map.get("ORIGIN_LOCATION_NAME__C") is None
-        else str(row_map.get("ORIGIN_LOCATION_NAME__C"))
-    )
-    destination = (
-        ""
-        if row_map.get("DESTINATION_LOCATION_NAME__C") is None
-        else str(row_map.get("DESTINATION_LOCATION_NAME__C"))
-    )
-    return carrier_code + service + origin + destination
 
 
 def list_input_files():
@@ -136,6 +112,9 @@ def parse_file(file_path: Path):
             row_map = dict(zip(headers, row))
             if row_map.get("KEY") in (None, ""):
                 continue
+            skip, _reason = should_skip_rate_update_route(row_map)
+            if skip:
+                continue
 
             record = {
                 "source_file": file_path.name,
@@ -151,6 +130,8 @@ def parse_file(file_path: Path):
 
             grouped = {}
             for col, value in row_map.items():
+                if col in IGNORED_RATE_COLUMNS:
+                    continue
                 match = RATE_COL_RE.match(col)
                 if not match:
                     continue
