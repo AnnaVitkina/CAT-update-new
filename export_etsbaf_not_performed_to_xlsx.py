@@ -6,7 +6,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from paths import OUTPUT_DIR, PROCESSING_DIR
+from cat_paths import OUTPUT_DIR, PROCESSING_DIR
 
 HEADER_FILL = PatternFill(fill_type="solid", start_color="D9E1F2", end_color="D9E1F2")
 HEADER_FONT = Font(bold=True)
