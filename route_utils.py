@@ -16,6 +16,51 @@ def trim_service(service_value):
     return service
 
 
+def trim_service_for_transporeon(service_value, key=None):
+    key_str = str(key or "")
+    if "OC_RRBB" in key_str:
+        return "RRBB"
+
+    service = "" if service_value is None else str(service_value)
+    if service.startswith("OC_RRBB"):
+        return "RRBB"
+    if service.startswith("OC_CNTR_"):
+        service = service[len("OC_CNTR_") :]
+    elif service.startswith("OC_CNTTR_"):
+        service = service[len("OC_CNTTR_") :]
+    if service.endswith("_BU"):
+        service = service[: -len("_BU")]
+    return service
+
+
+def build_transporeon_id(row_map):
+    carrier_code = "" if row_map.get("CARRIER") is None else str(row_map.get("CARRIER"))
+    service = trim_service_for_transporeon(row_map.get("SERVICE__C"), row_map.get("KEY"))
+    origin = (
+        ""
+        if row_map.get("ORIGIN_LOCATION_NAME__C") is None
+        else str(row_map.get("ORIGIN_LOCATION_NAME__C"))
+    )
+    destination = (
+        ""
+        if row_map.get("DESTINATION_LOCATION_NAME__C") is None
+        else str(row_map.get("DESTINATION_LOCATION_NAME__C"))
+    )
+    return carrier_code + service + origin + destination
+
+
+def is_bu_key_lane(key):
+    key_str = str(key or "")
+    return "_BU-" in key_str or "_CY-CY_BU-" in key_str or "_CY-CY_BU_" in key_str
+
+
+def should_skip_rate_update_route(row_map):
+    key = str(row_map.get("KEY") or "")
+    if "OC_RRBB_SPOT" in key:
+        return True, "OC_RRBB SPOT lane with PRP rates is out of scope"
+    return False, None
+
+
 def rate_card_includes_fr(source_file):
     if not source_file:
         return False
