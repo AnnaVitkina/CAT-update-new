@@ -133,6 +133,11 @@ def main():
     run_py("export_updated_json_to_xlsx_json_only.py", final_json.name)
     final_xlsx = OUTPUT_DIR / f"{final_json.stem}.xlsx"
 
+    not_performed_xlsx = None
+    if not_performed_json and not_performed_json.exists():
+        run_py("export_etsbaf_not_performed_to_xlsx.py", not_performed_json.name)
+        not_performed_xlsx = OUTPUT_DIR / f"{not_performed_json.stem}.xlsx"
+
     print("\nPipeline completed.")
     print(f"Code root: {CODE_ROOT}")
     print(f"Input storage: {INPUT_STORAGE}")
@@ -144,6 +149,8 @@ def main():
     print(f"Final XLSX: {final_xlsx}")
     if not_performed_json:
         print(f"ETSBAF not performed log: {not_performed_json}")
+        if not_performed_xlsx:
+            print(f"ETSBAF not performed XLSX: {not_performed_xlsx}")
     else:
         print("ETSBAF step skipped (no ETSBAF sheet in update JSON).")
 
