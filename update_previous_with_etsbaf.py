@@ -18,7 +18,7 @@ from cost_utils import (
 )
 
 
-from paths import PROCESSING_DIR
+from cat_paths import PROCESSING_DIR
 
 
 def parse_ddmmyyyy(value):
