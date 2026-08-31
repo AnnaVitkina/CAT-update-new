@@ -3,7 +3,7 @@ from pathlib import Path
 
 _DEFAULT_DRIVE_BASE = Path(
     "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team "
-    "/Documents/AI Adoption RMT/RMT_CAT/RMT_CAT_update"
+    "/Documents/AI Adoption RMT/RMT_CAT_update"
 )
 
 
@@ -24,11 +24,38 @@ def _storage_path(env_key: str, default: Path) -> Path:
     return Path(override) if override else default
 
 
+def _resolve_storage_roots() -> tuple[Path, Path, Path]:
+    # Explicit env overrides (set by run_pipeline subprocess calls).
+    if any(
+        os.environ.get(key)
+        for key in ("CAT_INPUT_STORAGE", "CAT_PROCESSING_STORAGE", "CAT_OUTPUT_STORAGE")
+    ):
+        return (
+            _storage_path("CAT_INPUT_STORAGE", _DEFAULT_DRIVE_BASE / "input"),
+            _storage_path("CAT_PROCESSING_STORAGE", _DEFAULT_DRIVE_BASE / "processing"),
+            _storage_path("CAT_OUTPUT_STORAGE", _DEFAULT_DRIVE_BASE / "output"),
+        )
+
+    # Colab: use Google Drive when the shared project folder is mounted.
+    if _DEFAULT_DRIVE_BASE.exists():
+        return (
+            _DEFAULT_DRIVE_BASE / "input",
+            _DEFAULT_DRIVE_BASE / "processing",
+            _DEFAULT_DRIVE_BASE / "output",
+        )
+
+    # Local machine: keep data next to the code checkout.
+    code_root = resolve_code_root()
+    return (
+        code_root / "input",
+        code_root / "processing",
+        code_root / "output",
+    )
+
+
 CODE_ROOT = resolve_code_root()
 
-INPUT_STORAGE = _storage_path("CAT_INPUT_STORAGE", _DEFAULT_DRIVE_BASE / "input")
-PROCESSING_STORAGE = _storage_path("CAT_PROCESSING_STORAGE", _DEFAULT_DRIVE_BASE / "processing")
-OUTPUT_STORAGE = _storage_path("CAT_OUTPUT_STORAGE", _DEFAULT_DRIVE_BASE / "output")
+INPUT_STORAGE, PROCESSING_STORAGE, OUTPUT_STORAGE = _resolve_storage_roots()
 
 INPUT_PREVIOUS_DIR = INPUT_STORAGE / "previous rate card"
 INPUT_UPDATE_DIR = INPUT_STORAGE / "rate updates"
