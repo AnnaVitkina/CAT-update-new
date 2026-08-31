@@ -13,7 +13,7 @@ from route_utils import (
 from cost_utils import merge_metrics, migrate_cost_names_in_records, normalize_container_code, normalize_cost_title
 
 
-from paths import PROCESSING_DIR
+from cat_paths import PROCESSING_DIR
 
 def to_ddmmyyyy(value):
     if not value:
