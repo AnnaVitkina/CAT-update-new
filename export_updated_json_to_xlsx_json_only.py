@@ -16,7 +16,7 @@ LEGACY_FLAT_COLUMN_COSTS = {
 }
 
 
-from paths import OUTPUT_DIR, PROCESSING_DIR
+from cat_paths import OUTPUT_DIR, PROCESSING_DIR
 
 TITLE_ROW = 1
 SUBTITLE_ROW = 2
