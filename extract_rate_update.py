@@ -9,7 +9,7 @@ from openpyxl import load_workbook
 from cost_utils import normalize_container_code
 from route_utils import build_transporeon_id, should_skip_rate_update_route
 
-from paths import INPUT_UPDATE_DIR, PROCESSING_DIR
+from cat_paths import INPUT_UPDATE_DIR, PROCESSING_DIR
 
 INPUT_DIR = INPUT_UPDATE_DIR
 OUTPUT_DIR = PROCESSING_DIR
