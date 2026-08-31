@@ -481,6 +481,14 @@ def cleanup_plain_stubs_globally(records):
         rec["rates"] = filtered
 
 
+def dedupe_container_for_cost(cost):
+    return str(
+        extract_container_from_cost_title(cost.get("cost_name"))
+        or cost.get("container_type")
+        or ""
+    )
+
+
 def dedupe_same_validity_costs(lane):
     rates = lane.get("rates", [])
     if not rates:
@@ -498,7 +506,7 @@ def dedupe_same_validity_costs(lane):
     # Keep deterministic order by scanning left-to-right.
     for idx, cost in enumerate(rates):
         family = family_of(cost.get("cost_name"))
-        container = str(cost.get("container_type") or extract_container_from_cost_title(cost.get("cost_name")) or "")
+        container = dedupe_container_for_cost(cost)
         validity = str(cost.get("validity_period") or "")
         if family is None or not container or not validity:
             continue
@@ -534,7 +542,7 @@ def dedupe_same_validity_costs(lane):
     for idx, cost in enumerate(rates):
         family = str(cost.get("cost_name") or "")
         if family.startswith("BAF Fee") or family.startswith("EU ETS Fee"):
-            container = str(cost.get("container_type") or extract_container_from_cost_title(cost.get("cost_name")) or "")
+            container = dedupe_container_for_cost(cost)
             validity = str(cost.get("validity_period") or "")
             if container and validity:
                 if idx not in keep_idxs:
@@ -653,6 +661,8 @@ def main():
 
     print(f"Created ETSBAF updated file: {out_path}")
     print(f"Created ETSBAF not-performed file: {np_path}")
+    if not_performed:
+        print(f"ETSBAF not-performed count: {len(not_performed)}")
 
 
 if __name__ == "__main__":
