@@ -20,7 +20,15 @@ def bootstrap_code_root():
 
 CODE_ROOT = bootstrap_code_root()
 
-import paths  # noqa: E402
+# Colab may have a third-party package named "paths" cached in sys.modules.
+_stale_paths = sys.modules.get("paths")
+if _stale_paths is not None and not hasattr(_stale_paths, "refresh_storage_paths"):
+    del sys.modules["paths"]
+
+import importlib
+import cat_paths  # noqa: E402
+
+importlib.reload(cat_paths)
 
 
 def choose_file(files, prompt, cli_arg_index):
@@ -60,28 +68,28 @@ def run_py(script_name, *args):
     cmd = [sys.executable, str(CODE_ROOT / script_name), *args]
     env = os.environ.copy()
     env["CAT_CODE_ROOT"] = str(CODE_ROOT)
-    env["CAT_INPUT_STORAGE"] = str(paths.INPUT_STORAGE)
-    env["CAT_PROCESSING_STORAGE"] = str(paths.PROCESSING_STORAGE)
-    env["CAT_OUTPUT_STORAGE"] = str(paths.OUTPUT_STORAGE)
+    env["CAT_INPUT_STORAGE"] = str(cat_paths.INPUT_STORAGE)
+    env["CAT_PROCESSING_STORAGE"] = str(cat_paths.PROCESSING_STORAGE)
+    env["CAT_OUTPUT_STORAGE"] = str(cat_paths.OUTPUT_STORAGE)
     subprocess.run(cmd, check=True, cwd=CODE_ROOT, env=env)
 
 
 def main():
-    paths.refresh_storage_paths()
+    cat_paths.refresh_storage_paths()
 
-    previous_files = sorted(paths.INPUT_PREVIOUS_DIR.glob("*.xlsx"))
-    update_files = sorted(paths.INPUT_UPDATE_DIR.glob("*.xlsx"))
+    previous_files = sorted(cat_paths.INPUT_PREVIOUS_DIR.glob("*.xlsx"))
+    update_files = sorted(cat_paths.INPUT_UPDATE_DIR.glob("*.xlsx"))
     if not previous_files:
         raise FileNotFoundError(
-            f"No .xlsx files in {paths.INPUT_PREVIOUS_DIR}. "
+            f"No .xlsx files in {cat_paths.INPUT_PREVIOUS_DIR}. "
             "On Colab, input files must be on Google Drive under "
-            f"{paths.INPUT_STORAGE / 'previous rate card'}."
+            f"{cat_paths.INPUT_STORAGE / 'previous rate card'}."
         )
     if not update_files:
         raise FileNotFoundError(
-            f"No .xlsx files in {paths.INPUT_UPDATE_DIR}. "
+            f"No .xlsx files in {cat_paths.INPUT_UPDATE_DIR}. "
             "On Colab, input files must be on Google Drive under "
-            f"{paths.INPUT_STORAGE / 'rate updates'}."
+            f"{cat_paths.INPUT_STORAGE / 'rate updates'}."
         )
 
     previous_xlsx = choose_file(
@@ -99,8 +107,8 @@ def main():
     run_py("extract_previous_rate_card.py", previous_xlsx.name)
     run_py("extract_rate_update.py", update_xlsx.name)
 
-    previous_json = paths.PROCESSING_DIR / f"{previous_xlsx.stem}.json"
-    update_json = paths.PROCESSING_DIR / f"{update_xlsx.stem}.json"
+    previous_json = cat_paths.PROCESSING_DIR / f"{previous_xlsx.stem}.json"
+    update_json = cat_paths.PROCESSING_DIR / f"{update_xlsx.stem}.json"
 
     update_payload = json.loads(update_json.read_text(encoding="utf-8"))
     update_records = update_payload.get("records", [])
@@ -117,33 +125,33 @@ def main():
     # 2) Apply BASE update first when BASE exists.
     if has_base:
         run_py("update_previous_with_base.py", previous_json.name, update_json.name)
-        current_json = paths.PROCESSING_DIR / f"{previous_json.stem}_updated.json"
+        current_json = cat_paths.PROCESSING_DIR / f"{previous_json.stem}_updated.json"
     else:
         current_json = previous_json
 
     # 3) Apply ETSBAF update on top of latest JSON only when ETSBAF exists.
     if has_etsbaf:
         run_py("update_previous_with_etsbaf.py", current_json.name, update_json.name)
-        final_json = paths.PROCESSING_DIR / f"{current_json.stem}_updated_etsbaf.json"
-        not_performed_json = paths.PROCESSING_DIR / f"{current_json.stem}_etsbaf_not_performed.json"
+        final_json = cat_paths.PROCESSING_DIR / f"{current_json.stem}_updated_etsbaf.json"
+        not_performed_json = cat_paths.PROCESSING_DIR / f"{current_json.stem}_etsbaf_not_performed.json"
     else:
         final_json = current_json
         not_performed_json = None
 
     # 4) Export final JSON to XLSX.
     run_py("export_updated_json_to_xlsx_json_only.py", final_json.name)
-    final_xlsx = paths.OUTPUT_DIR / f"{final_json.stem}.xlsx"
+    final_xlsx = cat_paths.OUTPUT_DIR / f"{final_json.stem}.xlsx"
 
     not_performed_xlsx = None
     if not_performed_json and not_performed_json.exists():
         run_py("export_etsbaf_not_performed_to_xlsx.py", not_performed_json.name)
-        not_performed_xlsx = paths.OUTPUT_DIR / f"{not_performed_json.stem}.xlsx"
+        not_performed_xlsx = cat_paths.OUTPUT_DIR / f"{not_performed_json.stem}.xlsx"
 
     print("\nPipeline completed.")
     print(f"Code root: {CODE_ROOT}")
-    print(f"Input storage: {paths.INPUT_STORAGE}")
-    print(f"Processing storage: {paths.PROCESSING_STORAGE}")
-    print(f"Output storage: {paths.OUTPUT_STORAGE}")
+    print(f"Input storage: {cat_paths.INPUT_STORAGE}")
+    print(f"Processing storage: {cat_paths.PROCESSING_STORAGE}")
+    print(f"Output storage: {cat_paths.OUTPUT_STORAGE}")
     print(f"Previous source: {previous_xlsx}")
     print(f"Update source: {update_xlsx}")
     print(f"Final JSON: {final_json}")
@@ -157,6 +165,6 @@ def main():
 
 
 if __name__ == "__main__":
-    paths.refresh_storage_paths()
-    paths.ensure_storage_dirs()
+    cat_paths.refresh_storage_paths()
+    cat_paths.ensure_storage_dirs()
     main()
