@@ -5,8 +5,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from route_utils import (
+    apply_service_c_aliases,
     is_bu_key_lane,
     map_update_route_to_rate_card_fields,
+    route_service_c_value,
     should_skip_route_update,
     trim_service,
 )
@@ -83,7 +85,7 @@ def is_bu_related_service(service_value):
 
 def is_bu_related_update(update_record):
     route = update_record.get("route", {})
-    service = route.get("SERVICE__C")
+    service = route_service_c_value(route)
     if is_bu_related_service(service):
         return True
     return is_bu_key_lane(route.get("KEY"))
@@ -383,27 +385,40 @@ def build_new_lane(update_record, previous_records, base_rates_template, card_fr
         return None
 
     location_fields = map_update_route_to_rate_card_fields(route)
+    service_c = route_service_c_value(route)
+    lane_route = {
+        "Lane #": next_lane_number(previous_records),
+        "Transporeon ID": route.get("Transporeon ID"),
+        "KEY": route.get("KEY"),
+        "Carrier": route.get("CARRIER"),
+        "SERVICE": "not PRECARRIAGE/ONCARRIAGE",
+        "Service": trim_service(service_c),
+        "Valid from": format_ddmmyyyy(eff_from),
+        "Valid to": format_ddmmyyyy(eff_to),
+        "Origin Port": location_fields["Origin Port"],
+        "Origin Postal Code": location_fields["Origin Postal Code"],
+        "ORIGIN_COUNTRY__C": route.get("ORIGIN_COUNTRY__C"),
+        "Destination Port": location_fields["Destination Port"],
+        "Destination Postal Code": location_fields["Destination Postal Code"],
+        "DESTINATION_COUNTRY__C": route.get("DESTINATION_COUNTRY__C"),
+        "update_note": "(new)",
+        "update_source": "BASE",
+    }
+    apply_service_c_aliases(lane_route, service_c)
+
+    # Preserve previous rate-card column order for SERVICE_C / SERVICE__C.
+    if previous_records:
+        template_keys = list(previous_records[0].get("route", {}).keys())
+        ordered = {}
+        for key in template_keys:
+            if key in lane_route:
+                ordered[key] = lane_route.pop(key)
+        ordered.update(lane_route)
+        lane_route = ordered
+
     lane = {
         "row_number": next_row_number(previous_records),
-        "route": {
-            "Lane #": next_lane_number(previous_records),
-            "Transporeon ID": route.get("Transporeon ID"),
-            "KEY": route.get("KEY"),
-            "Carrier": route.get("CARRIER"),
-            "SERVICE": "not PRECARRIAGE/ONCARRIAGE",
-            "SERVICE__C": route.get("SERVICE__C"),
-            "Service": trim_service(route.get("SERVICE__C")),
-            "Valid from": format_ddmmyyyy(eff_from),
-            "Valid to": format_ddmmyyyy(eff_to),
-            "Origin Port": location_fields["Origin Port"],
-            "Origin Postal Code": location_fields["Origin Postal Code"],
-            "ORIGIN_COUNTRY__C": route.get("ORIGIN_COUNTRY__C"),
-            "Destination Port": location_fields["Destination Port"],
-            "Destination Postal Code": location_fields["Destination Postal Code"],
-            "DESTINATION_COUNTRY__C": route.get("DESTINATION_COUNTRY__C"),
-            "update_note": "(new)",
-            "update_source": "BASE",
-        },
+        "route": lane_route,
         "rates": [],
     }
     update_costs(base_rates_template, lane, update_record)
