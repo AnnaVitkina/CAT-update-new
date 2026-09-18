@@ -64,7 +64,28 @@ def choose_updated_json():
 
 
 def collect_route_keys(records):
-    return list(records[0].get("route", {}).keys()) if records else []
+    if not records:
+        return []
+    # Preserve first-lane order (previous rate card), then append any extra keys
+    # introduced by newly added lanes. Treat SERVICE_C / SERVICE__C as one field.
+    ordered = []
+    seen = set()
+    for rec in records:
+        for key in rec.get("route", {}).keys():
+            if key in {"update_note", "update_source", "update_changed_fields"}:
+                continue
+            if key == "SERVICE__C" and ("SERVICE_C" in seen or "SERVICE_C" in ordered):
+                continue
+            if key == "SERVICE_C" and "SERVICE__C" in seen:
+                # Prefer rate-card spelling if both appear later.
+                continue
+            if key not in seen:
+                seen.add(key)
+                ordered.append(key)
+    if "SERVICE_C" not in seen and "SERVICE__C" in seen:
+        # Normalize display name to SERVICE_C when only double-underscore exists.
+        ordered = ["SERVICE_C" if k == "SERVICE__C" else k for k in ordered]
+    return ordered
 
 
 def parse_ddmmyyyy(value):
@@ -146,8 +167,25 @@ def collect_cost_order(records, payload):
         # Plain form has only container in parentheses, e.g. "BAF Fee (22G0)".
         return bool(re.match(r"^(BAF Fee|EU ETS Fee) \([A-Z0-9]+\)$", name))
 
+    def is_non_equipment_baf_ets(cost_name, container):
+        """
+        BAF/EU ETS without equipment type, e.g. DFT or date-only titles.
+        Must sit after base fees and before equipment BAF/ETS.
+        """
+        name = str(cost_name or "")
+        if not (name.startswith("BAF Fee") or name.startswith("EU ETS Fee")):
+            return False
+        raw = str(container or "").strip().upper()
+        if raw in {"", "NONE", "DFT", "FRK"}:
+            return True
+        if re.match(r"^(BAF Fee|EU ETS Fee) \(\d{2}\.\d{2}\.\d{4}", name):
+            return True
+        return False
+
     def container_key_for_sort(cost_name, container):
         name = str(cost_name)
+        if is_non_equipment_baf_ets(name, container):
+            return -1
         if name in ("BAF Fee", "EU ETS Fee"):
             return -1
         order = {"22G0": 22, "25G0": 25, "42G0": 42, "45G0": 45, "52G0": 52}
@@ -158,6 +196,7 @@ def collect_cost_order(records, payload):
     special_sorted = sorted(
         special,
         key=lambda n: (
+            0 if is_non_equipment_baf_ets(n, cost_meta_for_sort[n]["container"]) else 1,
             container_key_for_sort(n, cost_meta_for_sort[n]["container"]),
             group_key(n),
             0 if is_plain_baf_ets(n) else 1,
@@ -330,7 +369,12 @@ def write_records(ws, records, route_keys, cost_names, cost_metrics, payload):
 
         for j, key in enumerate(route_keys):
             col = j + 1
-            ws.cell(row, col, route.get(key))
+            value = route.get(key)
+            if value in (None, "") and key in {"SERVICE_C", "SERVICE__C"}:
+                value = route.get("SERVICE_C")
+                if value in (None, ""):
+                    value = route.get("SERVICE__C")
+            ws.cell(row, col, value)
             if not highlight_route and route_source != "BASE" and not changed_fields:
                 continue
             if key in changed_fields:
