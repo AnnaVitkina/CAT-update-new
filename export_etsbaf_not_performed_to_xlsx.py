@@ -18,7 +18,8 @@ COLUMNS = [
     ("Sheet", lambda item: item.get("update_row", {}).get("sheet_name")),
     ("Row #", lambda item: item.get("update_row", {}).get("row_number")),
     ("Carrier", lambda item: item.get("update_row", {}).get("route", {}).get("CARRIER")),
-    ("Service", lambda item: item.get("update_row", {}).get("route", {}).get("SERVICE__C")),
+    ("Service", lambda item: item.get("update_row", {}).get("route", {}).get("SERVICE__C")
+        or item.get("update_row", {}).get("route", {}).get("SERVICE_C")),
     ("Valid from", lambda item: item.get("update_row", {}).get("route", {}).get("RATE_EFFECTIVE_DATE__C")),
     ("Valid to", lambda item: item.get("update_row", {}).get("route", {}).get("RATE_EXPIRATION_DATE__C")),
     ("Origin", lambda item: item.get("update_row", {}).get("route", {}).get("ORIGIN_LOCATION_NAME__C")),
