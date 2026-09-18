@@ -5,6 +5,30 @@ from pathlib import Path
 CNSHA_PORT_VALUE = "CNSHA/CNSHG/CNSGH"
 
 
+def route_service_c_value(route_or_row):
+    """Treat SERVICE_C and SERVICE__C as the same field."""
+    if not route_or_row:
+        return None
+    for key in ("SERVICE__C", "SERVICE_C", "Service"):
+        value = route_or_row.get(key)
+        if value not in (None, ""):
+            # Prefer raw service codes over trimmed display "Service".
+            if key == "Service":
+                continue
+            return value
+    for key in ("SERVICE__C", "SERVICE_C"):
+        if key in route_or_row:
+            return route_or_row.get(key)
+    return None
+
+
+def apply_service_c_aliases(route, service_value):
+    """Write both rate-card and update-file spellings of SERVICE_C."""
+    route["SERVICE_C"] = service_value
+    route["SERVICE__C"] = service_value
+    return route
+
+
 def trim_service(service_value):
     service = "" if service_value is None else str(service_value)
     if service.startswith("OC_CNTR_"):
@@ -35,7 +59,7 @@ def trim_service_for_transporeon(service_value, key=None):
 
 def build_transporeon_id(row_map):
     carrier_code = "" if row_map.get("CARRIER") is None else str(row_map.get("CARRIER"))
-    service = trim_service_for_transporeon(row_map.get("SERVICE__C"), row_map.get("KEY"))
+    service = trim_service_for_transporeon(route_service_c_value(row_map), row_map.get("KEY"))
     origin = (
         ""
         if row_map.get("ORIGIN_LOCATION_NAME__C") is None
@@ -81,7 +105,7 @@ def route_destination_country(route):
 
 
 def route_service_value(route):
-    return route.get("SERVICE__C") or route.get("Service") or route.get("SERVICE_C")
+    return route_service_c_value(route) or route.get("Service") or route.get("SERVICE_C")
 
 
 def is_cfs_cfs_route(route):
