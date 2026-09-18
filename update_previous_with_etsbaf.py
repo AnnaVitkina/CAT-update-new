@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 from collections import Counter
 from datetime import datetime
@@ -264,13 +265,129 @@ def create_versioned_block(lane, base_name, container, update_rate, upd_from, up
     return new_block
 
 
+def is_ets_charge(charge_code):
+    return str(charge_code or "").lower() == "ets"
+
+
+def resolve_common_ets_validity(lane, all_records, upd_from, upd_to, cache=None):
+    """EU ETS uses one shared bracket validity across containers (base-like)."""
+    cache_key = ("EU_ETS_COMMON",)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+
+    periods = Counter()
+    for cost in lane.get("rates", []):
+        name = str(cost.get("cost_name", ""))
+        if not name.startswith("EU ETS Fee"):
+            continue
+        period = cost.get("validity_period")
+        if period and "-" in str(period):
+            periods[str(period)] += 1
+
+    if not periods:
+        for rec in all_records:
+            for cost in rec.get("rates", []):
+                name = str(cost.get("cost_name", ""))
+                if not name.startswith("EU ETS Fee"):
+                    continue
+                period = cost.get("validity_period")
+                if period and "-" in str(period):
+                    periods[str(period)] += 1
+
+    if periods:
+        period = periods.most_common(1)[0][0]
+        result = parse_validity_period(period)
+    else:
+        result = (upd_from, upd_to)
+
+    if cache is not None:
+        cache[cache_key] = result
+    return result
+
+
+def find_existing_ets_blocks(family):
+    return [cost for cost in family if extract_container_from_cost_title(cost.get("cost_name"))]
+
+
+def create_ets_block(lane, base_name, container, update_rate, block_from, block_to, template=None):
+    source = template or {}
+    new_block = {
+        "cost_name": full_cost_name(base_name, block_from, block_to),
+        "container_type": container,
+        "apply_if": source.get("apply_if") or "Applies if invoiced by Carrier",
+        "validity_period": f"{fmt(block_from)}-{fmt(block_to)}",
+        "cost_to_prolong": source.get("cost_to_prolong"),
+        "rate_by": source.get("rate_by") or rate_by_for_container(container),
+        "rule": source.get("rule") or "Regular rule",
+        "currency": update_rate.get("currency"),
+        "flat_min": None,
+        "p_unit": update_rate.get("rate"),
+        "update_note": "(new)",
+    }
+    if source.get("metrics"):
+        new_block["metrics"] = list(source.get("metrics"))
+    else:
+        new_block["metrics"] = ["currency", "p_unit"]
+    lane.setdefault("rates", []).append(new_block)
+    return new_block
+
+
+def update_or_create_ets_cost_block(lane, update_rate, upd_from, upd_to, all_records, cache=None):
+    """
+    EU ETS is base-like: one shared validity in brackets for all containers.
+    Update existing container cost if present; otherwise add only when missing,
+    preserving the common validity pattern from sibling EU ETS costs.
+    """
+    container = map_container(update_rate.get("container_type"))
+    container = resolve_etsbaf_container(
+        lane.get("rates", []), update_rate.get("charge_code"), container, target_cost_name
+    )
+    base_name = target_cost_name(update_rate.get("charge_code"), container)
+    if not base_name:
+        return False
+
+    family = family_blocks(lane.get("rates", []), base_name)
+    existing = find_existing_ets_blocks(family)
+    if existing:
+        for target in existing:
+            ensure_cost_container_type(target)
+            target["currency"] = update_rate.get("currency")
+            target["p_unit"] = update_rate.get("rate")
+            target["flat_min"] = None
+            if target.get("update_note") != "(new)":
+                target["update_note"] = "(updated)"
+        return True
+
+    # Only add when this EU ETS container cost is not already present.
+    block_from, block_to = resolve_common_ets_validity(lane, all_records, upd_from, upd_to, cache)
+    if not (block_from and block_to):
+        return False
+
+    lane_from, lane_to = lane_validity(lane)
+    if lane_from and lane_to and not periods_intersect(lane_from, lane_to, block_from, block_to):
+        return False
+
+    template = next(
+        (
+            c
+            for c in lane.get("rates", [])
+            if str(c.get("cost_name", "")).startswith("EU ETS Fee")
+        ),
+        None,
+    )
+    create_ets_block(lane, base_name, container, update_rate, block_from, block_to, template)
+    return True
+
+
 def cleanup_non_overlapping_etsbaf_values(lane):
     lane_from, lane_to = lane_validity(lane)
     if not (lane_from and lane_to):
         return
     for cost in lane.get("rates", []):
         name = str(cost.get("cost_name", ""))
-        if not (name.startswith("BAF Fee") or name.startswith("EU ETS Fee")):
+        # EU ETS is base-like with a shared long validity; do not clear it
+        # based on lane/update period intersections like BAF.
+        if not name.startswith("BAF Fee"):
             continue
         c_from, c_to = cost_validity(cost)
         if not all([c_from, c_to]):
@@ -312,6 +429,11 @@ def find_matching_lanes(records, transporeon_id, rate_card_source_file):
 
 
 def update_or_create_cost_block(lane, update_rate, upd_from, upd_to, all_records, cache=None):
+    if is_ets_charge(update_rate.get("charge_code")):
+        return update_or_create_ets_cost_block(
+            lane, update_rate, upd_from, upd_to, all_records, cache
+        )
+
     container = map_container(update_rate.get("container_type"))
     container = resolve_etsbaf_container(lane.get("rates", []), update_rate.get("charge_code"), container, target_cost_name)
     base_name = target_cost_name(update_rate.get("charge_code"), container)
@@ -366,6 +488,28 @@ def cost_group_sort_key(cost_name):
     return 2
 
 
+def is_non_equipment_baf_ets(cost):
+    """
+    BAF/EU ETS without equipment type, e.g.:
+    - BAF Fee (DFT 01.06.2026-14.07.2026)
+    - BAF Fee (01.06.2026-14.07.2026)
+    These must sit after base fees and before equipment BAF/ETS.
+    """
+    name = str(cost.get("cost_name") or "")
+    if not (name.startswith("BAF Fee") or name.startswith("EU ETS Fee")):
+        return False
+    container = str(
+        extract_container_from_cost_title(name)
+        or cost.get("container_type")
+        or ""
+    ).strip().upper()
+    if container in {"", "NONE", "DFT", "FRK"}:
+        return True
+    if re.match(r"^(BAF Fee|EU ETS Fee) \(\d{2}\.\d{2}\.\d{4}", name):
+        return True
+    return False
+
+
 def validity_sort_key(validity_period):
     if not validity_period or "-" not in str(validity_period):
         return 99999999
@@ -390,10 +534,13 @@ def reorder_etsbaf_costs(lane):
         else:
             others.append((idx, cost))
 
-    # Desired order: per container -> BAF(all validities) -> EU ETS(all validities)
+    # Desired order:
+    # 1) non-equipment BAF/EU ETS (DFT / date-only), by family then validity
+    # 2) equipment BAF/EU ETS, per container -> BAF -> EU ETS -> validity
     groups.sort(
         key=lambda x: (
-            container_sort_key(x[1].get("container_type")),
+            0 if is_non_equipment_baf_ets(x[1]) else 1,
+            0 if is_non_equipment_baf_ets(x[1]) else container_sort_key(x[1].get("container_type")),
             cost_group_sort_key(x[1].get("cost_name")),
             validity_sort_key(x[1].get("validity_period")),
             str(x[1].get("cost_name", "")),
