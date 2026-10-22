@@ -4,7 +4,7 @@ from pathlib import Path
 
 _DEFAULT_DRIVE_BASE = Path(
     "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team "
-    "/Documents/AI Adoption RMT/RMT_CAT_update"
+    "/Documents/AI Adoption RMT/RMT_CAT/RMT_CAT_update"
 )
 
 COLAB_CODE_ROOT = Path("/content/CAT-update-new")
