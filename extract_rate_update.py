@@ -39,10 +39,44 @@ RATE_COL_RE = re.compile(
     r"^(?P<container>[0-9A-Z]+)_(?P<charge>[A-Z]+)_(?P<metric>CURRENCY|MIN|RATE)$"
 )
 
+# Excel uses fused "*DFTBAF_RATE" (no underscore between DFT and BAF).
+DFTBAF_COL_RE = re.compile(r"^DFTBAF_(?P<metric>CURRENCY|MIN|RATE)$")
+
 IGNORED_RATE_COLUMNS = {
     "DFTBASE_SLF_PRP_CURRENCY",
     "DFTBASE_SLF_PRP_RATE",
 }
+
+
+def normalize_rate_column_name(col):
+    """Strip leading '*' used on some pivot headers (e.g. *DFTBAF_RATE)."""
+    name = str(col or "").strip()
+    if name.startswith("*"):
+        name = name[1:].strip()
+    return name
+
+
+def parse_rate_column(col):
+    """
+    Return (container_type, charge_code, metric) or None.
+    Handles standard 22G0CNTR_BAF_RATE and fused DFTBAF_RATE → DFT + baf.
+    """
+    name = normalize_rate_column_name(col)
+    if not name or name in IGNORED_RATE_COLUMNS:
+        return None
+
+    dftbaf = DFTBAF_COL_RE.match(name)
+    if dftbaf:
+        return "DFT", "baf", dftbaf.group("metric").lower()
+
+    match = RATE_COL_RE.match(name)
+    if not match:
+        return None
+
+    container = normalize_container_code(match.group("container"))
+    charge = match.group("charge").lower()
+    metric = match.group("metric").lower()
+    return container, charge, metric
 
 
 def to_primitive(value):
@@ -130,16 +164,11 @@ def parse_file(file_path: Path):
 
             grouped = {}
             for col, value in row_map.items():
-                if col in IGNORED_RATE_COLUMNS:
-                    continue
-                match = RATE_COL_RE.match(col)
-                if not match:
+                parsed = parse_rate_column(col)
+                if not parsed:
                     continue
 
-                container = normalize_container_code(match.group("container"))
-                charge = match.group("charge").lower()
-                metric = match.group("metric").lower()
-
+                container, charge, metric = parsed
                 grouped.setdefault(container, {}).setdefault(
                     charge, {"charge_code": charge}
                 )[metric] = to_primitive(value)
