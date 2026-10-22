@@ -71,7 +71,24 @@ def run_py(script_name, *args):
     env["CAT_INPUT_STORAGE"] = str(cat_paths.INPUT_STORAGE)
     env["CAT_PROCESSING_STORAGE"] = str(cat_paths.PROCESSING_STORAGE)
     env["CAT_OUTPUT_STORAGE"] = str(cat_paths.OUTPUT_STORAGE)
-    subprocess.run(cmd, check=True, cwd=CODE_ROOT, env=env)
+    print(f"\n>>> Running: {' '.join(cmd)}")
+    completed = subprocess.run(
+        cmd,
+        cwd=CODE_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if completed.stdout:
+        print(completed.stdout, end="" if completed.stdout.endswith("\n") else "\n")
+    if completed.returncode != 0:
+        if completed.stderr:
+            print(completed.stderr, end="" if completed.stderr.endswith("\n") else "\n")
+        raise RuntimeError(
+            f"{script_name} failed with exit code {completed.returncode}.\n"
+            f"Command: {' '.join(cmd)}\n"
+            f"stderr:\n{completed.stderr or '(empty)'}"
+        )
 
 
 def main():
