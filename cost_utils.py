@@ -46,6 +46,9 @@ def extract_container_from_cost_title(title):
     inside = match.group(1).strip()
     if re.search(r"\d{2}\.\d{2}\.\d{4}", inside):
         token = inside.split()[0].strip()
+        # Date-only titles like "BAF Fee (01.06.2026 - 14.07.2026)" are DFT.
+        if re.match(r"\d{2}\.\d{2}\.\d{4}", token):
+            return "DFT"
         return normalize_container_code(token)
     return normalize_container_code(inside)
 
