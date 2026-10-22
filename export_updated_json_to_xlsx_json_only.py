@@ -1,43 +1,50 @@
 import json
-import re
 import sys
-from datetime import datetime
 from pathlib import Path
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
-
-from cost_utils import METRIC_ORDER, migrate_cost_names_in_records, normalize_cost_title
-
-LEGACY_FLAT_COLUMN_COSTS = {
-    "Base Rate (BASE_STAT_FRK)",
-    "RoRo Fee",
-    "Documentation Fee",
-}
-
+from openpyxl.utils import get_column_letter
 
 from cat_paths import OUTPUT_DIR, PROCESSING_DIR
 
-TITLE_ROW = 1
-SUBTITLE_ROW = 2
-COST_NAME_ROW = 3
-APPLY_IF_ROW = 4
-VALIDITY_ROW = 5
-PROLONG_ROW = 6
-RATE_BY_ROW = 7
-RULE_ROW = 8
-HEADER_ROW = 10
-DATA_START_ROW = 11
-
-GREEN_FILL = PatternFill(fill_type="solid", start_color="C6EFCE", end_color="C6EFCE")
 HEADER_FILL = PatternFill(fill_type="solid", start_color="D9E1F2", end_color="D9E1F2")
-META_FILL = PatternFill(fill_type="solid", start_color="F2F2F2", end_color="F2F2F2")
+HEADER_FONT = Font(bold=True)
+
+COLUMNS = [
+    ("KEY", lambda item: item.get("update_row", {}).get("route", {}).get("KEY")),
+    ("Reason", lambda item: item.get("reason")),
+    ("Transporeon ID", lambda item: item.get("transporeon_id")),
+    ("Sheet", lambda item: item.get("update_row", {}).get("sheet_name")),
+    ("Row #", lambda item: item.get("update_row", {}).get("row_number")),
+    ("Carrier", lambda item: item.get("update_row", {}).get("route", {}).get("CARRIER")),
+    ("Service", lambda item: item.get("update_row", {}).get("route", {}).get("SERVICE__C")
+        or item.get("update_row", {}).get("route", {}).get("SERVICE_C")),
+    ("Valid from", lambda item: item.get("update_row", {}).get("route", {}).get("RATE_EFFECTIVE_DATE__C")),
+    ("Valid to", lambda item: item.get("update_row", {}).get("route", {}).get("RATE_EXPIRATION_DATE__C")),
+    ("Origin", lambda item: item.get("update_row", {}).get("route", {}).get("ORIGIN_LOCATION_NAME__C")),
+    ("Destination", lambda item: item.get("update_row", {}).get("route", {}).get("DESTINATION_LOCATION_NAME__C")),
+    ("Charge codes", lambda item: _charge_codes(item)),
+]
 
 
-def choose_updated_json():
-    files = sorted(PROCESSING_DIR.glob("*updated*.json"))
+def _charge_codes(item):
+    rates = item.get("update_row", {}).get("rates", [])
+    parts = []
+    for rate in rates:
+        charge = str(rate.get("charge_code") or "").upper()
+        container = str(rate.get("container_type") or "")
+        if charge and container:
+            parts.append(f"{charge} ({container})")
+        elif charge:
+            parts.append(charge)
+    return ", ".join(parts)
+
+
+def choose_not_performed_json():
+    files = sorted(PROCESSING_DIR.glob("*_etsbaf_not_performed.json"))
     if not files:
-        raise FileNotFoundError(f"No *_updated.json files found in {PROCESSING_DIR}")
+        raise FileNotFoundError(f"No *_etsbaf_not_performed.json files found in {PROCESSING_DIR}")
 
     if len(sys.argv) > 1:
         arg = sys.argv[1].strip()
@@ -49,11 +56,11 @@ def choose_updated_json():
         candidate = PROCESSING_DIR / arg
         if candidate.exists():
             return candidate
-        raise FileNotFoundError(f"Could not find file in processing: {arg}")
+        raise FileNotFoundError(f"Could not find not-performed JSON: {arg}")
 
-    print("Choose updated JSON file:")
-    for i, path in enumerate(files, start=1):
-        print(f"{i}. {path.name}")
+    print("Choose ETSBAF not-performed JSON file:")
+    for i, file_path in enumerate(files, start=1):
+        print(f"{i}. {file_path.name}")
     selected = input("Enter file number: ").strip()
     if not selected.isdigit():
         raise ValueError("Please enter a valid number.")
@@ -63,366 +70,51 @@ def choose_updated_json():
     return files[idx]
 
 
-def collect_route_keys(records):
-    if not records:
-        return []
-    # Preserve first-lane order (previous rate card), then append any extra keys
-    # introduced by newly added lanes. Treat SERVICE_C / SERVICE__C as one field.
-    ordered = []
-    seen = set()
-    for rec in records:
-        for key in rec.get("route", {}).keys():
-            if key in {"update_note", "update_source", "update_changed_fields"}:
-                continue
-            if key == "SERVICE__C" and ("SERVICE_C" in seen or "SERVICE_C" in ordered):
-                continue
-            if key == "SERVICE_C" and "SERVICE__C" in seen:
-                # Prefer rate-card spelling if both appear later.
-                continue
-            if key not in seen:
-                seen.add(key)
-                ordered.append(key)
-    if "SERVICE_C" not in seen and "SERVICE__C" in seen:
-        # Normalize display name to SERVICE_C when only double-underscore exists.
-        ordered = ["SERVICE_C" if k == "SERVICE__C" else k for k in ordered]
-    return ordered
+def output_path_for(json_path: Path) -> Path:
+    return OUTPUT_DIR / f"{json_path.stem}.xlsx"
 
 
-def parse_ddmmyyyy(value):
-    if not value:
-        return None
-    try:
-        return datetime.strptime(str(value), "%d.%m.%Y").date()
-    except ValueError:
-        return None
+def autosize_columns(ws, num_cols, num_rows):
+    for col_idx in range(1, num_cols + 1):
+        letter = get_column_letter(col_idx)
+        max_len = len(str(ws.cell(row=1, column=col_idx).value or ""))
+        for row_idx in range(2, num_rows + 1):
+            value = ws.cell(row=row_idx, column=col_idx).value
+            if value is not None:
+                max_len = max(max_len, len(str(value)))
+        ws.column_dimensions[letter].width = min(max(max_len + 2, 12), 60)
 
 
-def parse_period(value):
-    if not value:
-        return (None, None)
-    raw = str(value).strip()
-    if "-" not in raw:
-        return (None, None)
-    a, b = raw.split("-", 1)
-    start = parse_ddmmyyyy(a.strip())
-    end = parse_ddmmyyyy(b.strip()) if b.strip().upper() != "N/A" else None
-    return (start, end)
-
-
-def is_cost_within_rate_card(cost_validity, card_validity):
-    if not card_validity:
-        return True
-    cost_start, cost_end = parse_period(cost_validity)
-    card_start, card_end = parse_period(card_validity)
-    if not (card_start and card_end):
-        return True
-    if not (cost_start and cost_end):
-        # Costs without explicit validity remain visible.
-        return True
-    return not (cost_end < card_start or cost_start > card_end)
-
-
-def collect_cost_order(records, payload):
-    card_validity = payload.get("rate_card_validity")
-    seen = set()
-    cost_meta_for_sort = {}
-    first_seen = []
-    for rec in records:
-        for rate in rec.get("rates", []):
-            name = str(rate.get("cost_name", ""))
-            if not name:
-                continue
-            if not is_cost_within_rate_card(rate.get("validity_period"), card_validity):
-                continue
-            if name not in seen:
-                seen.add(name)
-                first_seen.append(name)
-            if name not in cost_meta_for_sort:
-                cost_meta_for_sort[name] = {
-                    "container": str(rate.get("container_type") or ""),
-                    "validity": str(rate.get("validity_period") or ""),
-                }
-
-    def container_key(container):
-        order = {"22G0": 22, "25G0": 25, "42G0": 42, "45G0": 45, "52G0": 52}
-        return order.get(container, 999)
-
-    def group_key(cost_name):
-        if cost_name.startswith("BAF Fee"):
-            return 0
-        if cost_name.startswith("EU ETS Fee"):
-            return 1
-        return 2
-
-    def validity_key(validity):
-        start, _ = parse_period(validity)
-        if start is None:
-            return 99999999
-        return int(start.strftime("%Y%m%d"))
-
-    def is_plain_baf_ets(cost_name):
-        name = str(cost_name)
-        if name in ("BAF Fee", "EU ETS Fee"):
-            return True
-        # Plain form has only container in parentheses, e.g. "BAF Fee (22G0)".
-        return bool(re.match(r"^(BAF Fee|EU ETS Fee) \([A-Z0-9]+\)$", name))
-
-    def is_non_equipment_baf_ets(cost_name, container):
-        """
-        BAF/EU ETS without equipment type, e.g. DFT or date-only titles.
-        Must sit after base fees and before equipment BAF/ETS.
-        """
-        name = str(cost_name or "")
-        if not (name.startswith("BAF Fee") or name.startswith("EU ETS Fee")):
-            return False
-        raw = str(container or "").strip().upper()
-        if raw in {"", "NONE", "DFT", "FRK"}:
-            return True
-        if re.match(r"^(BAF Fee|EU ETS Fee) \(\d{2}\.\d{2}\.\d{4}", name):
-            return True
-        return False
-
-    def container_key_for_sort(cost_name, container):
-        name = str(cost_name)
-        if is_non_equipment_baf_ets(name, container):
-            return -1
-        if name in ("BAF Fee", "EU ETS Fee"):
-            return -1
-        order = {"22G0": 22, "25G0": 25, "42G0": 42, "45G0": 45, "52G0": 52}
-        return order.get(str(container), 999)
-
-    # Apply container/group sorting ONLY to BAF/EU ETS, keep others as-is.
-    special = [n for n in first_seen if group_key(n) in (0, 1)]
-    special_sorted = sorted(
-        special,
-        key=lambda n: (
-            0 if is_non_equipment_baf_ets(n, cost_meta_for_sort[n]["container"]) else 1,
-            container_key_for_sort(n, cost_meta_for_sort[n]["container"]),
-            group_key(n),
-            0 if is_plain_baf_ets(n) else 1,
-            validity_key(cost_meta_for_sort[n]["validity"]),
-            n,
-        ),
-    )
-
-    # Final order:
-    # 1) all non-BAF/EU ETS in original order
-    # 2) BAF/EU ETS in sorted order
-    # Non-special columns should follow the previous rate-card order.
-    # The first lane preserves that order best, so use it as the baseline.
-    baseline = []
-    if records:
-        for rate in records[0].get("rates", []):
-            name = str(rate.get("cost_name", ""))
-            if name and name in seen and group_key(name) not in (0, 1) and name not in baseline:
-                baseline.append(name)
-    # Add any remaining non-special costs that did not appear in first lane.
-    non_special = baseline + [n for n in first_seen if group_key(n) not in (0, 1) and n not in baseline]
-    ordered = non_special + special_sorted
-    return ordered
-
-
-def collect_cost_meta(records, payload):
-    forced_new_costs = set(payload.get("update_context", {}).get("new_cost_names", []))
-    meta = {}
-    for rec in records:
-        for rate in rec.get("rates", []):
-            name = str(rate.get("cost_name", ""))
-            if not name:
-                continue
-            if name not in meta:
-                meta[name] = {
-                    "apply_if": rate.get("apply_if"),
-                    "validity_period": rate.get("validity_period"),
-                    "cost_to_prolong": rate.get("cost_to_prolong"),
-                    "rate_by": rate.get("rate_by"),
-                    "rule": rate.get("rule"),
-                    "is_new": (rate.get("update_note") == "(new)") or (name in forced_new_costs),
-                    "is_changed": rate.get("update_note") in {"(new)", "(updated)"},
-                }
-            else:
-                for k in ("apply_if", "validity_period", "cost_to_prolong", "rate_by", "rule"):
-                    if not meta[name].get(k) and rate.get(k):
-                        meta[name][k] = rate.get(k)
-                if rate.get("update_note") == "(new)" or name in forced_new_costs:
-                    meta[name]["is_new"] = True
-                if rate.get("update_note") in {"(new)", "(updated)"}:
-                    meta[name]["is_changed"] = True
-    return meta
-
-
-def resolve_cost_metrics(records, cost_name):
-    metrics = set()
-    has_flat_value = False
-    has_punit_value = False
-    for rec in records:
-        for rate in rec.get("rates", []):
-            if normalize_cost_title(rate.get("cost_name")) != cost_name:
-                continue
-            if rate.get("metrics"):
-                metrics.update(rate["metrics"])
-            if rate.get("flat_min") is not None:
-                has_flat_value = True
-            if rate.get("p_unit") is not None:
-                has_punit_value = True
-    if metrics:
-        return [m for m in METRIC_ORDER if m in metrics]
-    if cost_name in LEGACY_FLAT_COLUMN_COSTS:
-        return ["currency", "flat_min", "p_unit"]
-    resolved = ["currency"]
-    if has_flat_value:
-        resolved.append("flat_min")
-    if has_punit_value:
-        resolved.append("p_unit")
-    return resolved if len(resolved) > 1 else ["currency", "p_unit"]
-
-
-def collect_cost_metrics(records, cost_names):
-    metrics = {}
-    for cost_name in cost_names:
-        metrics[cost_name] = resolve_cost_metrics(records, cost_name)
-    return metrics
-
-
-def metric_label(metric_key):
-    return "Currency" if metric_key == "currency" else ("Flat" if metric_key == "flat_min" else "p/unit")
-
-
-def write_layout(ws, payload, route_keys, cost_names, cost_meta, cost_metrics):
-    ws.title = "Rate card"
-    ws.cell(TITLE_ROW, 1, "Rate Card (Generated from JSON)")
-    ws.cell(TITLE_ROW, 1).font = Font(bold=True, size=12)
-    ws.cell(SUBTITLE_ROW, 1, f"Source JSON: {payload.get('source_file', '')}")
-    ws.cell(SUBTITLE_ROW, 2, f"Record count: {payload.get('record_count', 0)}")
-
-    col = 1
-    for route_name in route_keys:
-        ws.cell(HEADER_ROW, col, route_name)
-        ws.cell(HEADER_ROW, col).font = Font(bold=True)
-        ws.cell(HEADER_ROW, col).fill = HEADER_FILL
-        ws.column_dimensions[ws.cell(HEADER_ROW, col).column_letter].width = 18
-        col += 1
-
-    for cost_name in cost_names:
-        metric_keys = cost_metrics[cost_name]
-        span = len(metric_keys)
-        ws.merge_cells(start_row=COST_NAME_ROW, start_column=col, end_row=COST_NAME_ROW, end_column=col + span - 1)
-        ws.cell(COST_NAME_ROW, col, cost_name)
-        ws.cell(COST_NAME_ROW, col).font = Font(bold=True)
-
-        meta = cost_meta.get(cost_name, {})
-        apply_if = meta.get("apply_if")
-        validity = meta.get("validity_period")
-        prolong = meta.get("cost_to_prolong")
-        rate_by = meta.get("rate_by")
-        rule = meta.get("rule")
-        is_changed_cost = bool(meta.get("is_changed"))
-        meta_fill = GREEN_FILL if is_changed_cost else META_FILL
-        ws.cell(COST_NAME_ROW, col).fill = meta_fill
-
-        ws.merge_cells(start_row=APPLY_IF_ROW, start_column=col, end_row=APPLY_IF_ROW, end_column=col + span - 1)
-        ws.cell(APPLY_IF_ROW, col, f"Apply if: {apply_if}" if apply_if else None)
-        ws.cell(APPLY_IF_ROW, col).fill = meta_fill
-
-        ws.merge_cells(start_row=VALIDITY_ROW, start_column=col, end_row=VALIDITY_ROW, end_column=col + span - 1)
-        ws.cell(VALIDITY_ROW, col, f"Validity: {validity}" if validity else None)
-        ws.cell(VALIDITY_ROW, col).fill = meta_fill
-
-        ws.merge_cells(start_row=PROLONG_ROW, start_column=col, end_row=PROLONG_ROW, end_column=col + span - 1)
-        ws.cell(PROLONG_ROW, col, f"Prolong: {prolong}" if prolong else None)
-        ws.cell(PROLONG_ROW, col).fill = meta_fill
-
-        ws.merge_cells(start_row=RATE_BY_ROW, start_column=col, end_row=RATE_BY_ROW, end_column=col + span - 1)
-        ws.cell(RATE_BY_ROW, col, f"Rate by: {rate_by}" if rate_by else None)
-        ws.cell(RATE_BY_ROW, col).fill = meta_fill
-
-        ws.merge_cells(start_row=RULE_ROW, start_column=col, end_row=RULE_ROW, end_column=col + span - 1)
-        ws.cell(RULE_ROW, col, f"Rule: {rule}" if rule else None)
-        ws.cell(RULE_ROW, col).fill = meta_fill
-
-        for offset, metric_key in enumerate(metric_keys):
-            c = col + offset
-            ws.cell(HEADER_ROW, c, metric_label(metric_key))
-            ws.cell(HEADER_ROW, c).font = Font(bold=True)
-            ws.cell(HEADER_ROW, c).fill = HEADER_FILL
-            ws.column_dimensions[ws.cell(HEADER_ROW, c).column_letter].width = 14
-        col += span
-
-
-def write_records(ws, records, route_keys, cost_names, cost_metrics, payload):
-    route_count = len(route_keys)
-    cost_start_col = {}
-    running = route_count + 1
-    for name in cost_names:
-        cost_start_col[name] = running
-        running += len(cost_metrics[name])
-
-    sheet_used = str(payload.get("update_context", {}).get("sheet_used", "")).upper()
-    highlight_route = sheet_used not in {"ETSBAF", "EU ETS", "EU_ETS"}
-
-    for i, rec in enumerate(records):
-        row = DATA_START_ROW + i
-        route = rec.get("route", {})
-        route_updated = route.get("update_note") in {"(new)", "(updated)"}
-        changed_fields = set(route.get("update_changed_fields", []))
-        route_source = str(route.get("update_source", "")).upper()
-
-        for j, key in enumerate(route_keys):
-            col = j + 1
-            value = route.get(key)
-            if value in (None, "") and key in {"SERVICE_C", "SERVICE__C"}:
-                value = route.get("SERVICE_C")
-                if value in (None, ""):
-                    value = route.get("SERVICE__C")
-            ws.cell(row, col, value)
-            if not highlight_route and route_source != "BASE" and not changed_fields:
-                continue
-            if key in changed_fields:
-                ws.cell(row, col).fill = GREEN_FILL
-            elif route_updated and not changed_fields:
-                ws.cell(row, col).fill = GREEN_FILL
-
-        for rate in rec.get("rates", []):
-            name = str(rate.get("cost_name", ""))
-            if name not in cost_start_col:
-                continue
-            base_col = cost_start_col[name]
-            metric_keys = cost_metrics[name]
-            for offset, metric_key in enumerate(metric_keys):
-                ws.cell(row, base_col + offset, rate.get(metric_key))
-            if rate.get("update_note") in {"(new)", "(updated)"}:
-                for offset in range(len(metric_keys)):
-                    ws.cell(row, base_col + offset).fill = GREEN_FILL
-
-
-def main():
-    json_path = choose_updated_json()
+def export_to_xlsx(json_path: Path, output_xlsx: Path) -> int:
     payload = json.loads(json_path.read_text(encoding="utf-8"))
-    records = payload.get("records", [])
-    migrate_cost_names_in_records(records)
-    if not records:
-        raise ValueError("No records found in updated JSON.")
-
-    route_keys = collect_route_keys(records)
-    cost_names = collect_cost_order(records, payload)
-    cost_meta = collect_cost_meta(records, payload)
-    cost_metrics = collect_cost_metrics(records, cost_names)
+    items = payload.get("items", [])
 
     wb = Workbook()
     ws = wb.active
-    write_layout(ws, payload, route_keys, cost_names, cost_meta, cost_metrics)
-    write_records(ws, records, route_keys, cost_names, cost_metrics, payload)
+    ws.title = "ETSBAF not performed"
 
+    for col_idx, (header, _) in enumerate(COLUMNS, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+
+    for row_idx, item in enumerate(items, start=2):
+        for col_idx, (_, getter) in enumerate(COLUMNS, start=1):
+            value = getter(item)
+            ws.cell(row=row_idx, column=col_idx, value=value)
+
+    autosize_columns(ws, len(COLUMNS), len(items) + 1)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    output_xlsx = OUTPUT_DIR / f"{json_path.stem}.xlsx"
-    try:
-        wb.save(output_xlsx)
-    except PermissionError:
-        fallback = OUTPUT_DIR / f"{json_path.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        wb.save(fallback)
-        output_xlsx = fallback
-    print(f"Created: {output_xlsx}")
-    print("Template used: None (JSON-only layout)")
+    wb.save(output_xlsx)
+    return len(items)
+
+
+def main():
+    json_path = choose_not_performed_json()
+    output_xlsx = output_path_for(json_path)
+    count = export_to_xlsx(json_path, output_xlsx)
+    print(f"Wrote {count} rows to {output_xlsx}")
+    print(f"Source JSON: {json_path}")
 
 
 if __name__ == "__main__":
