@@ -7,10 +7,15 @@ from pathlib import Path
 from route_utils import (
     apply_service_c_aliases,
     is_bu_key_lane,
+    is_bu_related_service,
+    is_rail_service,
+    is_spot_key,
+    is_spot_service,
     map_update_route_to_rate_card_fields,
     route_service_c_value,
     should_skip_route_update,
     trim_service,
+    update_service_priority,
 )
 from cost_utils import merge_metrics, migrate_cost_names_in_records, normalize_container_code, normalize_cost_title
 
@@ -79,16 +84,17 @@ def clamp_period_to_rate_card(period_from, period_to, card_from, card_to):
     return (start, end)
 
 
-def is_bu_related_service(service_value):
-    return str(service_value or "").endswith("_BU")
-
-
 def is_bu_related_update(update_record):
     route = update_record.get("route", {})
     service = route_service_c_value(route)
     if is_bu_related_service(service):
         return True
     return is_bu_key_lane(route.get("KEY"))
+
+
+def is_spot_related_update(update_record):
+    route = update_record.get("route", {})
+    return is_spot_service(route_service_c_value(route)) or is_spot_key(route.get("KEY"))
 
 
 def update_validity_period(update_record):
@@ -147,24 +153,183 @@ def filter_container_alias_conflicts(update_records):
     return [rec for rec in update_records if id(rec) not in drop_ids]
 
 
-def filter_bu_service_conflicts(update_records):
+def _build_variant_merge(group):
+    """Merge distinct KEY / SERVICE_C values with '/', priority order then KEY."""
+    ordered = sorted(
+        group,
+        key=lambda r: (
+            update_service_priority(r.get("route", {})),
+            str((r.get("route") or {}).get("KEY") or ""),
+        ),
+    )
+    keys = []
+    services = []
+    seen_keys = set()
+    seen_services = set()
+    for rec in ordered:
+        route = rec.get("route") or {}
+        key = str(route.get("KEY") or "").strip()
+        if key and key not in seen_keys:
+            seen_keys.add(key)
+            keys.append(key)
+        svc = str(route_service_c_value(route) or "").strip()
+        if svc and svc not in seen_services:
+            seen_services.add(svc)
+            services.append(svc)
+    return {
+        "KEY": " / ".join(keys),
+        "SERVICE_C": " / ".join(services),
+    }
+
+
+def collect_variant_merges_by_tid(records):
+    """
+    Build slash-merged KEY/SERVICE_C per Transporeon ID from any update rows
+    (all sheets). CY-CY may appear on BASE while CY-CY_BU only on ETSBAF.
+    """
+    grouped = {}
+    for rec in records or []:
+        tid = (rec.get("route") or {}).get("Transporeon ID") or ""
+        if not tid:
+            continue
+        grouped.setdefault(tid, []).append(rec)
+
+    merge_by_tid = {}
+    for tid, group in grouped.items():
+        distinct_keys = {str((r.get("route") or {}).get("KEY") or "") for r in group}
+        distinct_keys.discard("")
+        distinct_svcs = {
+            str(route_service_c_value(r.get("route") or {}) or "") for r in group
+        }
+        distinct_svcs.discard("")
+        if len(distinct_keys) > 1 or len(distinct_svcs) > 1:
+            merge_by_tid[tid] = _build_variant_merge(group)
+    return merge_by_tid
+
+
+def filter_service_variant_conflicts(update_records, variant_catalog=None):
+    """
+    Same Transporeon ID may carry SPOT, standard (e.g. CY-CY), and _BU variants.
+
+    Priority on conflict: SPOT > non-_BU > _BU
+    - identical validity → drop lower priority; mark survivor for orange highlight
+    - overlapping validity → drop lower priority (higher wins)
+    - no overlap → keep both
+
+    Slash-merged KEY/SERVICE_C are built from variant_catalog when provided
+    (typically all sheets in the rate-update file); otherwise from update_records.
+    Conflict dropping still applies only within update_records.
+    """
     grouped = {}
     for rec in update_records:
         tid = rec.get("route", {}).get("Transporeon ID") or ""
         grouped.setdefault(tid, []).append(rec)
 
     drop_ids = set()
+    orange_ids = set()
+    merge_by_tid = collect_variant_merges_by_tid(
+        variant_catalog if variant_catalog is not None else update_records
+    )
+
     for tid, group in grouped.items():
         if not tid:
             continue
-        has_standard = any(not is_bu_related_update(r) for r in group)
-        if not has_standard:
-            continue
-        for rec in group:
-            if is_bu_related_update(rec):
-                drop_ids.add(id(rec))
 
-    return [rec for rec in update_records if id(rec) not in drop_ids]
+        for rec_low in group:
+            p_low = update_service_priority(rec_low.get("route", {}))
+            low_from, low_to = update_validity_period(rec_low)
+            if not (low_from and low_to):
+                continue
+            for rec_high in group:
+                if rec_low is rec_high:
+                    continue
+                p_high = update_service_priority(rec_high.get("route", {}))
+                if p_low <= p_high:
+                    continue
+                high_from, high_to = update_validity_period(rec_high)
+                if not (high_from and high_to):
+                    continue
+                if not validity_ranges_intersect(low_from, low_to, high_from, high_to):
+                    continue
+                drop_ids.add(id(rec_low))
+                if low_from == high_from and low_to == high_to:
+                    orange_ids.add(id(rec_high))
+
+    result = []
+    for rec in update_records:
+        if id(rec) in drop_ids:
+            continue
+        route = rec.setdefault("route", {})
+        tid = route.get("Transporeon ID") or ""
+        merge = merge_by_tid.get(tid)
+        if merge:
+            route["merged_KEY"] = merge["KEY"]
+            route["merged_SERVICE_C"] = merge["SERVICE_C"]
+        if id(rec) in orange_ids:
+            route["update_highlight"] = "orange"
+        result.append(rec)
+    return result
+
+
+# Backward-compatible alias
+def filter_bu_service_conflicts(update_records):
+    return filter_service_variant_conflicts(update_records)
+
+
+def stamp_variant_fields(lane, update_record):
+    """Write slash-merged KEY and SERVICE_C / SERVICE__C (not Service) onto a lane."""
+    route = lane.setdefault("route", {})
+    upd_route = update_record.get("route") or {}
+    changed = set(route.get("update_changed_fields") or [])
+
+    merged_key = upd_route.get("merged_KEY")
+    if merged_key and route.get("KEY") != merged_key:
+        route["KEY"] = merged_key
+        changed.add("KEY")
+
+    merged_svc = upd_route.get("merged_SERVICE_C")
+    if merged_svc:
+        prev_svc = route_service_c_value(route)
+        if prev_svc != merged_svc:
+            changed.add("SERVICE_C")
+        # Only KEY + SERVICE_C / SERVICE__C are slash-merged; leave Service alone.
+        apply_service_c_aliases(route, merged_svc)
+
+    if upd_route.get("update_highlight") == "orange":
+        route["update_highlight"] = "orange"
+
+    if changed:
+        route["update_changed_fields"] = sorted(changed)
+
+
+def stamp_location_fields(lane, update_record):
+    """
+    For rail CY-RR / RR-CY lanes, map LOCATION_NAME onto Port XOR Postal:
+    combined values (e.g. ZADUR_ZAJNB) → Postal only; plain codes → Port only.
+    """
+    upd_route = update_record.get("route") or {}
+    lane_route = lane.setdefault("route", {})
+    service = (
+        route_service_c_value(upd_route)
+        or route_service_c_value(lane_route)
+        or lane_route.get("Service")
+        or upd_route.get("KEY")
+        or lane_route.get("KEY")
+    )
+    if not is_rail_service(service):
+        return
+
+    fields = map_update_route_to_rate_card_fields(upd_route)
+    changed = set(lane_route.get("update_changed_fields") or [])
+    for key, value in fields.items():
+        # Normalize missing port to empty string to match rate-card layout.
+        if value is None:
+            value = ""
+        if lane_route.get(key) != value:
+            lane_route[key] = value
+            changed.add(key)
+    if changed:
+        lane_route["update_changed_fields"] = sorted(changed)
 
 
 def map_container_type(update_container_type):
@@ -385,14 +550,17 @@ def build_new_lane(update_record, previous_records, base_rates_template, card_fr
         return None
 
     location_fields = map_update_route_to_rate_card_fields(route)
-    service_c = route_service_c_value(route)
+    # SERVICE_C / KEY may be slash-merged; Service stays a single trimmed value.
+    service_c = route.get("merged_SERVICE_C") or route_service_c_value(route)
+    key_value = route.get("merged_KEY") or route.get("KEY")
+    service_display = trim_service(route_service_c_value(route))
     lane_route = {
         "Lane #": next_lane_number(previous_records),
         "Transporeon ID": route.get("Transporeon ID"),
-        "KEY": route.get("KEY"),
+        "KEY": key_value,
         "Carrier": route.get("CARRIER"),
         "SERVICE": "not PRECARRIAGE/ONCARRIAGE",
-        "Service": trim_service(service_c),
+        "Service": service_display,
         "Valid from": format_ddmmyyyy(eff_from),
         "Valid to": format_ddmmyyyy(eff_to),
         "Origin Port": location_fields["Origin Port"],
@@ -405,6 +573,8 @@ def build_new_lane(update_record, previous_records, base_rates_template, card_fr
         "update_source": "BASE",
     }
     apply_service_c_aliases(lane_route, service_c)
+    if route.get("update_highlight") == "orange":
+        lane_route["update_highlight"] = "orange"
 
     # Preserve previous rate-card column order for SERVICE_C / SERVICE__C.
     if previous_records:
@@ -581,10 +751,14 @@ def main():
 
     previous_records = previous.get("records", [])
     migrate_cost_names_in_records(previous_records)
-    update_records = [r for r in updates.get("records", []) if r.get("sheet_name") == "BASE"]
+    all_update_records = updates.get("records", []) or []
+    update_records = [r for r in all_update_records if r.get("sheet_name") == "BASE"]
     if not update_records:
         raise ValueError("No BASE records found in rate update file.")
-    update_records = filter_bu_service_conflicts(update_records)
+    # Merge KEY/SERVICE across all sheets (e.g. CY-CY on BASE + CY-CY_BU on ETSBAF).
+    update_records = filter_service_variant_conflicts(
+        update_records, variant_catalog=all_update_records
+    )
     update_records = filter_container_alias_conflicts(update_records)
     rate_card_source = previous.get("source_file")
     update_records = [
@@ -621,10 +795,8 @@ def main():
                 previous_records.append(new_lane)
             continue
 
-        inserted_offset = 0
         applied = False
-        for base_idx in matching_idxs:
-            idx = base_idx + inserted_offset
+        for idx in matching_idxs:
             lane = previous_records[idx]
             lane_from = parse_ddmmyyyy(lane.get("route", {}).get("Valid from"))
             lane_to = parse_ddmmyyyy(lane.get("route", {}).get("Valid to"))
@@ -641,19 +813,24 @@ def main():
                 if not segments:
                     continue
                 applied = True
-                for seg_idx, segment_item in enumerate(segments):
-                    segment = segment_item["lane"]
+                for segment_item in segments:
                     if segment_item["kind"] == "update":
-                        apply_update_only_to_costs(segment, upd, base_rates_template)
-                    if seg_idx == 0:
-                        previous_records[idx] = segment
-                    else:
-                        previous_records.insert(idx + seg_idx, segment)
-                inserted_offset += len(segments) - 1
+                        stamp_variant_fields(segment_item["lane"], upd)
+                        stamp_location_fields(segment_item["lane"], upd)
+                        apply_update_only_to_costs(
+                            segment_item["lane"], upd, base_rates_template
+                        )
+                # Keep the first segment in place (usually the shortened original).
+                # Append any additional split-created lanes at the end of the file.
+                previous_records[idx] = segments[0]["lane"]
+                for segment_item in segments[1:]:
+                    previous_records.append(segment_item["lane"])
             else:
                 applied = True
                 lane.setdefault("route", {})["update_note"] = "(updated)"
                 lane["route"]["update_source"] = "BASE"
+                stamp_variant_fields(lane, upd)
+                stamp_location_fields(lane, upd)
                 apply_update_only_to_costs(lane, upd, base_rates_template)
 
         if not applied:
