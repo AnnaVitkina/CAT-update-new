@@ -4,7 +4,7 @@ from pathlib import Path
 
 _DEFAULT_DRIVE_BASE = Path(
     "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team "
-    "/Documents/AI Adoption RMT/RMT_CAT_update"
+    "/Documents/AI Adoption RMT/RMT_CAT/RMT_CAT_update"
 )
 
 COLAB_CODE_ROOT = Path("/content/CAT-update-new")
@@ -106,7 +106,7 @@ def validate_colab_storage() -> None:
         raise RuntimeError(
             "Google Drive is mounted, but the project storage folder was not found:\n"
             f"  {_DEFAULT_DRIVE_BASE}\n"
-            "Check the Shared Drive path in paths.py and confirm the folder exists."
+            "Check the Shared Drive path in cat_paths.py and confirm the folder exists."
         )
 
 
