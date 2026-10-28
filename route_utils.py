@@ -32,22 +32,36 @@ def apply_service_c_aliases(route, service_value):
 
 def trim_service(service_value):
     service = "" if service_value is None else str(service_value)
+    # Display form matches Transporeon / existing RA Service column.
+    if service.startswith("OC_RRBB") or service == "RRBB":
+        return "RRBB"
+    if service.startswith("OC_LOLO") or service == "LOLO":
+        return "LOLO"
     if service.startswith("OC_CNTR_"):
         service = service[len("OC_CNTR_") :]
     elif service.startswith("OC_CNTTR_"):
         service = service[len("OC_CNTTR_") :]
+    # SPOT shares CY-CY identity: Service column stays CY-CY (prices may still be SPOT).
+    if service == "SPOT":
+        return "CY-CY"
     if service.endswith("_BU"):
         service = service[: -len("_BU")]
     return service
 
 
 def trim_service_for_display(service_value):
-    """Strip OC_CNTR_ prefix but keep _BU / SPOT markers for slash-merged Service."""
+    """Strip OC_CNTR_ prefix but keep _BU markers; SPOT displays as CY-CY."""
     service = "" if service_value is None else str(service_value).strip()
+    if service.startswith("OC_RRBB") or service == "RRBB":
+        return "RRBB"
+    if service.startswith("OC_LOLO") or service == "LOLO":
+        return "LOLO"
     if service.startswith("OC_CNTR_"):
         service = service[len("OC_CNTR_") :]
     elif service.startswith("OC_CNTTR_"):
         service = service[len("OC_CNTTR_") :]
+    if service == "SPOT":
+        return "CY-CY"
     return service
 
 
@@ -55,10 +69,14 @@ def trim_service_for_transporeon(service_value, key=None):
     key_str = str(key or "")
     if "OC_RRBB" in key_str:
         return "RRBB"
+    if "OC_LOLO" in key_str:
+        return "LOLO"
 
     service = "" if service_value is None else str(service_value)
     if service.startswith("OC_RRBB"):
         return "RRBB"
+    if service.startswith("OC_LOLO"):
+        return "LOLO"
     if service.startswith("OC_CNTR_"):
         service = service[len("OC_CNTR_") :]
     elif service.startswith("OC_CNTTR_"):
@@ -121,10 +139,24 @@ def update_service_priority(route):
     return PRIORITY_STANDARD
 
 
+def is_d_cy_route(route_or_row):
+    """Door-CY (OC_CNTR_D-CY) inland/door services are out of scope."""
+    if not route_or_row:
+        return False
+    key = str(route_or_row.get("KEY") or "")
+    service = str(route_service_c_value(route_or_row) or route_or_row.get("Service") or "")
+    if "OC_CNTR_D-CY" in key or "OC_CNTR_D-CY" in service:
+        return True
+    trimmed = trim_service(service)
+    return trimmed == "D-CY" or trimmed.startswith("D-CY")
+
+
 def should_skip_rate_update_route(row_map):
     key = str(row_map.get("KEY") or "")
     if "OC_RRBB_SPOT" in key:
         return True, "OC_RRBB SPOT lane with PRP rates is out of scope"
+    if is_d_cy_route(row_map):
+        return True, "D-CY (door) service is out of scope"
     return False, None
 
 
@@ -204,6 +236,8 @@ def is_rail_service(service_value):
 def should_skip_route_update(route, rate_card_source_file):
     if is_cfs_cfs_route(route):
         return True, "CFS-CFS service"
+    if is_d_cy_route(route):
+        return True, "D-CY (door) service is out of scope"
 
     destination = route_destination_country(route)
     includes_fr = rate_card_includes_fr(rate_card_source_file)
