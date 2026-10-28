@@ -20,11 +20,14 @@ def normalize_cost_title(title):
 CONTAINER_ALIASES = {
     "22SOC": "22G0",
     "42P1S": "42G0",
+    # Pivot *DFTEU_ETS_* is DFT equipment for EU ETS Fee (DFT …)
+    "DFTEU": "DFT",
 }
 
 ETSBAF_CONTAINER_FALLBACKS = {
     "42P1S": "42G0",
     "22SOC": "22G0",
+    "DFTEU": "DFT",
 }
 
 
@@ -32,7 +35,7 @@ def normalize_container_code(container):
     if container in (None, ""):
         return container
     raw = str(container).replace("CNTR", "")
-    if raw == "FRK":
+    if raw in {"FRK", "DFTEU"}:
         return "DFT"
     return CONTAINER_ALIASES.get(raw, raw)
 
