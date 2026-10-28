@@ -215,24 +215,17 @@ def collect_cost_order(records, payload):
             return True
         return False
 
-    # Container rank = first appearance in original RA cost order (not hard-coded).
-    container_appearance = {}
     special = [n for n in first_seen if group_key(n) in (0, 1)]
-    for name in special:
-        if is_non_equipment_baf_ets(name, cost_meta_for_sort[name]["container"]):
-            continue
-        container = resolve_container(name, cost_meta_for_sort[name]["container"])
-        if container and container not in container_appearance:
-            container_appearance[container] = len(container_appearance)
 
     def container_key_for_sort(cost_name, container):
+        # Alphabetical equipment order (42SOC before 45SOC). New containers
+        # must not sink to the end just because they were absent from the RA.
         if is_non_equipment_baf_ets(cost_name, container):
-            return -1
-        resolved = resolve_container(cost_name, container)
-        return container_appearance.get(resolved, 10_000)
+            return ""
+        return resolve_container(cost_name, container)
 
     # Aggressive BAF/EU ETS grouping:
-    # DFT first, then equipment in original RA container order,
+    # DFT first, then equipment alphabetically by container,
     # BAF before EU ETS, chronological by name brackets.
     special_sorted = sorted(
         special,
