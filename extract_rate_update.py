@@ -35,15 +35,19 @@ COMMON_FIELDS = [
     "DESTINATION_CITY__C",
 ]
 
-RATE_COL_RE = re.compile(
-    r"^(?P<container>[0-9A-Z]+)_(?P<charge>[A-Z]+)_(?P<metric>CURRENCY|MIN|RATE)$"
+RATE_METRIC_RE = re.compile(
+    r"^(?P<head>.+)_(?P<metric>CURRENCY|MIN|RATE)$"
 )
 
 # Excel uses fused "*DFTBAF_RATE" (no underscore between DFT and BAF).
 DFTBAF_COL_RE = re.compile(r"^DFTBAF_(?P<metric>CURRENCY|MIN|RATE)$")
 
+# Fused DFT + BASE + equipment, e.g. DFTBASE_STAT_FRK_RATE → Base Rate (BASE_STAT_FRK).
+DFTBASE_STAT_FRK_RE = re.compile(r"^DFTBASE_STAT_FRK_(?P<metric>CURRENCY|MIN|RATE)$")
+
 IGNORED_RATE_COLUMNS = {
     "DFTBASE_SLF_PRP_CURRENCY",
+    "DFTBASE_SLF_PRP_MIN",
     "DFTBASE_SLF_PRP_RATE",
 }
 
@@ -59,7 +63,13 @@ def normalize_rate_column_name(col):
 def parse_rate_column(col):
     """
     Return (container_type, charge_code, metric) or None.
-    Handles standard 22G0CNTR_BAF_RATE and fused DFTBAF_RATE → DFT + baf.
+
+    Handles:
+    - 22G0CNTR_BAF_RATE → 22G0 + baf
+    - DFTBAF_RATE → DFT + baf
+    - DFTBASE_STAT_FRK_RATE → BASE_STAT_FRK + base
+    - DFTWM_WAR_RISK_CURRENCY → DFTWM + war_risk (multi-segment charge)
+    - 22G0CNTR_WAR_RISK_C_RATE → 22G0 + war_risk_c
     """
     name = normalize_rate_column_name(col)
     if not name or name in IGNORED_RATE_COLUMNS:
@@ -69,14 +79,26 @@ def parse_rate_column(col):
     if dftbaf:
         return "DFT", "baf", dftbaf.group("metric").lower()
 
-    match = RATE_COL_RE.match(name)
+    dftbase_frk = DFTBASE_STAT_FRK_RE.match(name)
+    if dftbase_frk:
+        return "BASE_STAT_FRK", "base", dftbase_frk.group("metric").lower()
+
+    match = RATE_METRIC_RE.match(name)
     if not match:
         return None
 
-    container = normalize_container_code(match.group("container"))
-    charge = match.group("charge").lower()
+    head = match.group("head")
     metric = match.group("metric").lower()
-    return container, charge, metric
+    if "_" not in head:
+        # e.g. DFTBIOFUEL_CURRENCY — no charge segment
+        return None
+
+    container_raw, charge = head.split("_", 1)
+    if not container_raw or not charge:
+        return None
+
+    container = normalize_container_code(container_raw)
+    return container, charge.lower(), metric
 
 
 def to_primitive(value):
@@ -169,9 +191,17 @@ def parse_file(file_path: Path):
                     continue
 
                 container, charge, metric = parsed
-                grouped.setdefault(container, {}).setdefault(
+                # Skip empty cells so alias containers (22SOC→22G0, 42P1S→42G0)
+                # do not wipe real 22G0/42G0 values with nulls.
+                if value is None or value == "":
+                    continue
+                bucket = grouped.setdefault(container, {}).setdefault(
                     charge, {"charge_code": charge}
-                )[metric] = to_primitive(value)
+                )
+                # Prefer an already-filled metric over a later empty/duplicate write.
+                if bucket.get(metric) not in (None, ""):
+                    continue
+                bucket[metric] = to_primitive(value)
 
             for container, charges in grouped.items():
                 for charge_data in charges.values():
