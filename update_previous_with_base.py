@@ -7,18 +7,18 @@ from pathlib import Path
 from route_utils import (
     apply_service_c_aliases,
     is_bu_key_lane,
-    is_bu_related_service,
     is_rail_service,
-    is_spot_key,
-    is_spot_service,
     map_update_route_to_rate_card_fields,
     route_service_c_value,
     should_skip_route_update,
     trim_service,
-    update_service_priority,
 )
 from cost_utils import merge_metrics, migrate_cost_names_in_records, normalize_container_code, normalize_cost_title
-
+from service_variants import (
+    filter_service_variant_conflicts,
+    stamp_variant_fields,
+    update_validity_period,
+)
 
 from cat_paths import PROCESSING_DIR
 
@@ -84,27 +84,6 @@ def clamp_period_to_rate_card(period_from, period_to, card_from, card_to):
     return (start, end)
 
 
-def is_bu_related_update(update_record):
-    route = update_record.get("route", {})
-    service = route_service_c_value(route)
-    if is_bu_related_service(service):
-        return True
-    return is_bu_key_lane(route.get("KEY"))
-
-
-def is_spot_related_update(update_record):
-    route = update_record.get("route", {})
-    return is_spot_service(route_service_c_value(route)) or is_spot_key(route.get("KEY"))
-
-
-def update_validity_period(update_record):
-    route = update_record.get("route", {})
-    return (
-        parse_yyyymmdd(route.get("RATE_EFFECTIVE_DATE__C")),
-        parse_yyyymmdd(route.get("RATE_EXPIRATION_DATE__C")),
-    )
-
-
 def get_normalized_base_rate_signature(update_record):
     for rate in update_record.get("rates", []):
         if str(rate.get("charge_code")).lower() != "base":
@@ -153,155 +132,6 @@ def filter_container_alias_conflicts(update_records):
     return [rec for rec in update_records if id(rec) not in drop_ids]
 
 
-def _build_variant_merge(group):
-    """Merge distinct KEY / SERVICE_C values with '/', priority order then KEY."""
-    ordered = sorted(
-        group,
-        key=lambda r: (
-            update_service_priority(r.get("route", {})),
-            str((r.get("route") or {}).get("KEY") or ""),
-        ),
-    )
-    keys = []
-    services = []
-    seen_keys = set()
-    seen_services = set()
-    for rec in ordered:
-        route = rec.get("route") or {}
-        key = str(route.get("KEY") or "").strip()
-        if key and key not in seen_keys:
-            seen_keys.add(key)
-            keys.append(key)
-        svc = str(route_service_c_value(route) or "").strip()
-        if svc and svc not in seen_services:
-            seen_services.add(svc)
-            services.append(svc)
-    return {
-        "KEY": " / ".join(keys),
-        "SERVICE_C": " / ".join(services),
-    }
-
-
-def collect_variant_merges_by_tid(records):
-    """
-    Build slash-merged KEY/SERVICE_C per Transporeon ID from any update rows
-    (all sheets). CY-CY may appear on BASE while CY-CY_BU only on ETSBAF.
-    """
-    grouped = {}
-    for rec in records or []:
-        tid = (rec.get("route") or {}).get("Transporeon ID") or ""
-        if not tid:
-            continue
-        grouped.setdefault(tid, []).append(rec)
-
-    merge_by_tid = {}
-    for tid, group in grouped.items():
-        distinct_keys = {str((r.get("route") or {}).get("KEY") or "") for r in group}
-        distinct_keys.discard("")
-        distinct_svcs = {
-            str(route_service_c_value(r.get("route") or {}) or "") for r in group
-        }
-        distinct_svcs.discard("")
-        if len(distinct_keys) > 1 or len(distinct_svcs) > 1:
-            merge_by_tid[tid] = _build_variant_merge(group)
-    return merge_by_tid
-
-
-def filter_service_variant_conflicts(update_records, variant_catalog=None):
-    """
-    Same Transporeon ID may carry SPOT, standard (e.g. CY-CY), and _BU variants.
-
-    Priority on conflict: SPOT > non-_BU > _BU
-    - identical validity → drop lower priority; mark survivor for orange highlight
-    - overlapping validity → drop lower priority (higher wins)
-    - no overlap → keep both
-
-    Slash-merged KEY/SERVICE_C are built from variant_catalog when provided
-    (typically all sheets in the rate-update file); otherwise from update_records.
-    Conflict dropping still applies only within update_records.
-    """
-    grouped = {}
-    for rec in update_records:
-        tid = rec.get("route", {}).get("Transporeon ID") or ""
-        grouped.setdefault(tid, []).append(rec)
-
-    drop_ids = set()
-    orange_ids = set()
-    merge_by_tid = collect_variant_merges_by_tid(
-        variant_catalog if variant_catalog is not None else update_records
-    )
-
-    for tid, group in grouped.items():
-        if not tid:
-            continue
-
-        for rec_low in group:
-            p_low = update_service_priority(rec_low.get("route", {}))
-            low_from, low_to = update_validity_period(rec_low)
-            if not (low_from and low_to):
-                continue
-            for rec_high in group:
-                if rec_low is rec_high:
-                    continue
-                p_high = update_service_priority(rec_high.get("route", {}))
-                if p_low <= p_high:
-                    continue
-                high_from, high_to = update_validity_period(rec_high)
-                if not (high_from and high_to):
-                    continue
-                if not validity_ranges_intersect(low_from, low_to, high_from, high_to):
-                    continue
-                drop_ids.add(id(rec_low))
-                if low_from == high_from and low_to == high_to:
-                    orange_ids.add(id(rec_high))
-
-    result = []
-    for rec in update_records:
-        if id(rec) in drop_ids:
-            continue
-        route = rec.setdefault("route", {})
-        tid = route.get("Transporeon ID") or ""
-        merge = merge_by_tid.get(tid)
-        if merge:
-            route["merged_KEY"] = merge["KEY"]
-            route["merged_SERVICE_C"] = merge["SERVICE_C"]
-        if id(rec) in orange_ids:
-            route["update_highlight"] = "orange"
-        result.append(rec)
-    return result
-
-
-# Backward-compatible alias
-def filter_bu_service_conflicts(update_records):
-    return filter_service_variant_conflicts(update_records)
-
-
-def stamp_variant_fields(lane, update_record):
-    """Write slash-merged KEY and SERVICE_C / SERVICE__C (not Service) onto a lane."""
-    route = lane.setdefault("route", {})
-    upd_route = update_record.get("route") or {}
-    changed = set(route.get("update_changed_fields") or [])
-
-    merged_key = upd_route.get("merged_KEY")
-    if merged_key and route.get("KEY") != merged_key:
-        route["KEY"] = merged_key
-        changed.add("KEY")
-
-    merged_svc = upd_route.get("merged_SERVICE_C")
-    if merged_svc:
-        prev_svc = route_service_c_value(route)
-        if prev_svc != merged_svc:
-            changed.add("SERVICE_C")
-        # Only KEY + SERVICE_C / SERVICE__C are slash-merged; leave Service alone.
-        apply_service_c_aliases(route, merged_svc)
-
-    if upd_route.get("update_highlight") == "orange":
-        route["update_highlight"] = "orange"
-
-    if changed:
-        route["update_changed_fields"] = sorted(changed)
-
-
 def stamp_location_fields(lane, update_record):
     """
     For rail CY-RR / RR-CY lanes, map LOCATION_NAME onto Port XOR Postal:
@@ -339,6 +169,62 @@ def map_container_type(update_container_type):
     return normalize_container_code(raw)
 
 
+# Pivot columns *DFTDOC_FEE_* / *DFTWM_* → RA cost names (often flat / no ISO container).
+FLAT_DFT_COST_MAP = {
+    ("fee", "DFTDOC"): {
+        "cost_name": "Documentation Fee",
+        "container_type": None,
+        "rate_field": "flat_min",
+        "rate_by": "per shipment",
+        "metrics": ["currency", "flat_min"],
+    },
+    ("cogh", "DFTWM"): {
+        "cost_name": "Handled Goods Fee",
+        "container_type": None,
+        "rate_field": "p_unit",
+        "rate_by": "Weight/chargeable kg",
+        "metrics": ["currency", "p_unit"],
+    },
+    ("war_risk", "DFTWM"): {
+        "cost_name": "War Risk Fee",
+        "container_type": None,
+        "rate_field": "p_unit",
+        "rate_by": "Weight/chargeable kg",
+        "metrics": ["currency", "p_unit"],
+    },
+    ("pcanal_o", "DFTWM"): {
+        "cost_name": "Panama Canal Charge (PCANAL)",
+        "container_type": "PCANAL",
+        "rate_field": "p_unit",
+        "rate_by": "Weight/chargeable kg",
+        "metrics": ["currency", "p_unit"],
+    },
+    ("scanal_o", "DFTWM"): {
+        "cost_name": "Suez Canal Charge (SCANAL)",
+        "container_type": "SCANAL",
+        "rate_field": "p_unit",
+        "rate_by": "Weight/chargeable kg",
+        "metrics": ["currency", "p_unit"],
+    },
+}
+
+
+def resolve_update_cost_target(charge_code, container_type):
+    """
+    Return (cost_name, container_type, meta) for an update rate.
+    meta may include rate_field / rate_by / metrics for flat DFT costs.
+    """
+    charge = str(charge_code or "").lower()
+    container = map_container_type(container_type)
+    flat = FLAT_DFT_COST_MAP.get((charge, str(container or "")))
+    if flat:
+        return flat["cost_name"], flat["container_type"], flat
+    base_name = map_charge_name(charge)
+    if container:
+        return normalize_cost_title(f"{base_name} ({container})"), container, None
+    return normalize_cost_title(base_name), container, None
+
+
 def map_charge_name(charge_code):
     mapping = {
         "base": "Base Rate",
@@ -347,7 +233,15 @@ def map_charge_name(charge_code):
         "dthc": "Destination Terminal Handling Fee",
         "othc": "Origin Terminal Handling Fee",
         "wrf": "War Risk Fee",
+        "war_risk": "War Risk Fee",
+        "war_risk_c": "War Risk Fee",
         "dcfs": "Destination CFS Fee",
+        "fee": "Documentation Fee",
+        "cogh": "Handled Goods Fee",
+        "danger_good": "Dangerous Goods Fee",
+        "pre_carr": "Pre-Carriage Fee",
+        "pcanal_o": "Panama Canal Charge",
+        "scanal_o": "Suez Canal Charge",
     }
     return mapping.get(str(charge_code).lower(), str(charge_code).upper())
 
@@ -397,10 +291,30 @@ def map_rate_by(container_type):
 
 
 def build_cost_name(charge_code, container_type):
-    base_name = map_charge_name(charge_code)
-    if container_type:
-        return normalize_cost_title(f"{base_name} ({container_type})")
-    return normalize_cost_title(base_name)
+    name, _container, _meta = resolve_update_cost_target(charge_code, container_type)
+    return name
+
+
+def apply_rate_value_to_cost(target, update_rate, charge_code, container, flat_meta=None):
+    """Write currency/min/rate onto the correct metric fields for the cost type."""
+    target["currency"] = update_rate.get("currency")
+    rate_value = update_rate.get("rate")
+    min_value = None if should_ignore_min(charge_code, container) else update_rate.get("min")
+
+    rate_field = (flat_meta or {}).get("rate_field")
+    if not rate_field:
+        metrics = target.get("metrics") or []
+        if "flat_min" in metrics and "p_unit" not in metrics:
+            rate_field = "flat_min"
+        else:
+            rate_field = "p_unit"
+
+    if rate_field == "flat_min":
+        target["flat_min"] = rate_value if rate_value is not None else min_value
+        target["p_unit"] = None
+    else:
+        target["flat_min"] = min_value
+        target["p_unit"] = rate_value
 
 
 def make_base_cost_template(cost):
@@ -416,21 +330,33 @@ def make_base_cost_template(cost):
 
 
 def make_new_cost(charge_code, container_type, template_cost=None):
+    cost_name, mapped_container, flat_meta = resolve_update_cost_target(
+        charge_code, container_type
+    )
     cost = {
-        "cost_name": build_cost_name(charge_code, container_type),
-        "container_type": container_type,
+        "cost_name": cost_name,
+        "container_type": mapped_container,
         "apply_if": "Applies if invoiced by Carrier",
         "validity_period": None,
         "cost_to_prolong": None,
-        "rate_by": "",
+        "rate_by": (flat_meta or {}).get("rate_by")
+        or map_rate_by(mapped_container)
+        or "",
         "rule": "Regular rule",
         "currency": None,
         "flat_min": None,
         "p_unit": None,
-        "metrics": ["currency", "p_unit"],
+        "metrics": list((flat_meta or {}).get("metrics") or ["currency", "p_unit"]),
     }
-    if template_cost and template_cost.get("metrics"):
-        cost["metrics"] = list(template_cost["metrics"])
+    if template_cost:
+        if template_cost.get("metrics"):
+            cost["metrics"] = list(template_cost["metrics"])
+        if template_cost.get("rate_by"):
+            cost["rate_by"] = template_cost.get("rate_by")
+        if template_cost.get("rule") is not None:
+            cost["rule"] = template_cost.get("rule")
+        if template_cost.get("apply_if"):
+            cost["apply_if"] = template_cost.get("apply_if")
     return cost
 
 
@@ -471,8 +397,9 @@ def update_costs(base_rates_template, lane_record, update_record):
 
     for upd in update_record.get("rates", []):
         charge_code = upd.get("charge_code")
-        container = map_container_type(upd.get("container_type"))
-        candidate_name = build_cost_name(charge_code, container)
+        candidate_name, container, flat_meta = resolve_update_cost_target(
+            charge_code, upd.get("container_type")
+        )
         lookup_key = (candidate_name, str(container))
 
         target, matched_key = find_cost_target(lane_costs, index, candidate_name, container)
@@ -485,15 +412,13 @@ def update_costs(base_rates_template, lane_record, update_record):
                 if c.get("cost_name") == candidate_name:
                     template_cost = c
                     break
-            target = make_new_cost(charge_code, container, template_cost)
+            target = make_new_cost(charge_code, upd.get("container_type"), template_cost)
             target["update_note"] = "(new)"
             lane_costs.append(target)
             index[lookup_key] = len(lane_costs) - 1
             is_new_cost = True
 
-        target["currency"] = upd.get("currency")
-        target["flat_min"] = None if should_ignore_min(charge_code, container) else upd.get("min")
-        target["p_unit"] = upd.get("rate")
+        apply_rate_value_to_cost(target, upd, charge_code, container, flat_meta)
         if not is_new_cost:
             target["update_note"] = "(updated)"
 
@@ -514,13 +439,14 @@ def apply_update_only_to_costs(lane_record, update_record, base_rates_template):
 
     for upd in update_record.get("rates", []):
         charge_code = upd.get("charge_code")
-        container = map_container_type(upd.get("container_type"))
-        candidate_name = build_cost_name(charge_code, container)
+        candidate_name, container, flat_meta = resolve_update_cost_target(
+            charge_code, upd.get("container_type")
+        )
 
         target, _matched_key = find_cost_target(lane_costs, index, candidate_name, container)
         if target is None:
             template_cost = next((c for c in base_rates_template if c.get("cost_name") == candidate_name), None)
-            target = make_new_cost(charge_code, container, template_cost)
+            target = make_new_cost(charge_code, upd.get("container_type"), template_cost)
             target["update_note"] = "(new)"
             insert_at = template_index.get((candidate_name, str(container)))
             if insert_at is None:
@@ -532,9 +458,7 @@ def apply_update_only_to_costs(lane_record, update_record, base_rates_template):
             }
             target, _ = find_cost_target(lane_costs, index, candidate_name, container)
 
-        target["currency"] = upd.get("currency")
-        target["flat_min"] = None if should_ignore_min(charge_code, container) else upd.get("min")
-        target["p_unit"] = upd.get("rate")
+        apply_rate_value_to_cost(target, upd, charge_code, container, flat_meta)
         if target.get("update_note") != "(new)":
             target["update_note"] = "(updated)"
 
@@ -551,9 +475,16 @@ def build_new_lane(update_record, previous_records, base_rates_template, card_fr
 
     location_fields = map_update_route_to_rate_card_fields(route)
     # SERVICE_C / KEY may be slash-merged; Service stays a single trimmed value.
+    # SPOT shares CY-CY identity in the Service column (prices may still be SPOT).
     service_c = route.get("merged_SERVICE_C") or route_service_c_value(route)
     key_value = route.get("merged_KEY") or route.get("KEY")
     service_display = trim_service(route_service_c_value(route))
+    if (
+        "SPOT" in str(service_c or "")
+        or "SPOT" in str(key_value or "")
+        or service_display == "SPOT"
+    ):
+        service_display = "CY-CY"
     lane_route = {
         "Lane #": next_lane_number(previous_records),
         "Transporeon ID": route.get("Transporeon ID"),
@@ -633,6 +564,12 @@ def ensure_global_cost_layout(previous_records, base_rates_template, update_reco
         for record in previous_records:
             if "rates" not in record or not isinstance(record["rates"], list):
                 record["rates"] = []
+            # main() may pass record[0].rates as base_rates_template; that list
+            # already received the insert above — do not insert twice.
+            if record["rates"] is base_rates_template:
+                if base_rates_template[insert_at].get("update_note") != "(new)":
+                    base_rates_template[insert_at]["update_note"] = "(new)"
+                continue
             inserted = make_base_cost_template(new_cost)
             inserted["update_note"] = "(new)"
             record["rates"].insert(insert_at, inserted)
@@ -766,9 +703,26 @@ def main():
         for upd in update_records
         if not should_skip_route_update(upd.get("route", {}), rate_card_source)[0]
     ]
+    # Apply order:
+    # 1) earlier effective date first (e.g. CY-CY Jun–May, then SPOT Sep–May splits it)
+    # 2) longer expiration first when starts match (e.g. _BU Jun–May, then Jun–Oct
+    #    carves the high-rate window instead of overwriting and dropping Nov–May)
+    def _base_apply_sort_key(rec):
+        route = rec.get("route") or {}
+        eff = parse_yyyymmdd(route.get("RATE_EFFECTIVE_DATE__C"))
+        exp = parse_yyyymmdd(route.get("RATE_EXPIRATION_DATE__C"))
+        return (
+            eff or datetime.max.date(),
+            # Longer validity first → negate to_ordinal for ascending sort.
+            -(exp.toordinal() if exp else 0),
+            int(rec.get("row_number") or 0),
+        )
+
+    update_records.sort(key=_base_apply_sort_key)
 
     template_record = get_lane_template(previous_records) if previous_records else {"rates": []}
-    base_rates_template = template_record.get("rates", [])
+    # Independent copy so ensure_global_cost_layout does not double-insert into lane 0.
+    base_rates_template = deepcopy(template_record.get("rates", []))
     new_cost_names = ensure_global_cost_layout(previous_records, base_rates_template, update_records)
     card_from, card_to = parse_validity_range(previous.get("rate_card_validity"))
 
@@ -792,6 +746,8 @@ def main():
         if not matching_idxs:
             new_lane = build_new_lane(upd, previous_records, base_rates_template, card_from, card_to)
             if new_lane is not None:
+                stamp_variant_fields(new_lane, upd)
+                stamp_location_fields(new_lane, upd)
                 previous_records.append(new_lane)
             continue
 
@@ -836,6 +792,8 @@ def main():
         if not applied:
             new_lane = build_new_lane(upd, previous_records, base_rates_template, card_from, card_to)
             if new_lane is not None:
+                stamp_variant_fields(new_lane, upd)
+                stamp_location_fields(new_lane, upd)
                 previous_records.append(new_lane)
 
     renumber_rows_and_lanes(previous_records)
