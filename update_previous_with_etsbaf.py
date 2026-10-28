@@ -8,6 +8,10 @@ from pathlib import Path
 from route_utils import (
     should_skip_route_update,
 )
+from service_variants import (
+    filter_service_variant_conflicts,
+    stamp_variant_fields,
+)
 from cost_utils import (
     costs_same_family,
     ensure_cost_container_type,
@@ -337,7 +341,15 @@ def update_or_create_ets_cost_block(lane, update_rate, upd_from, upd_to, all_rec
     EU ETS is base-like: one shared validity in brackets for all containers.
     Update existing container cost if present; otherwise add only when missing,
     preserving the common validity pattern from sibling EU ETS costs.
+
+    After BASE validity splits, empty EU ETS stubs are cloned onto every segment.
+    Only fill a lane whose validity intersects this ETSBAF update window.
     """
+    lane_from, lane_to = lane_validity(lane)
+    if lane_from and lane_to and upd_from and upd_to:
+        if not periods_intersect(lane_from, lane_to, upd_from, upd_to):
+            return False
+
     container = map_container(update_rate.get("container_type"))
     container = resolve_etsbaf_container(
         lane.get("rates", []), update_rate.get("charge_code"), container, target_cost_name
@@ -363,7 +375,6 @@ def update_or_create_ets_cost_block(lane, update_rate, upd_from, upd_to, all_rec
     if not (block_from and block_to):
         return False
 
-    lane_from, lane_to = lane_validity(lane)
     if lane_from and lane_to and not periods_intersect(lane_from, lane_to, block_from, block_to):
         return False
 
@@ -386,7 +397,8 @@ def cleanup_non_overlapping_etsbaf_values(lane):
     for cost in lane.get("rates", []):
         name = str(cost.get("cost_name", ""))
         # EU ETS is base-like with a shared long validity; do not clear it
-        # based on lane/update period intersections like BAF.
+        # based on cost-bracket vs lane like BAF. Extra-lane ETS fills are
+        # cleared separately via cleanup_ets_filled_on_non_overlapping_lanes.
         if not name.startswith("BAF Fee"):
             continue
         c_from, c_to = cost_validity(cost)
@@ -400,23 +412,51 @@ def cleanup_non_overlapping_etsbaf_values(lane):
         cost.pop("update_note", None)
 
 
-def find_matching_lanes(records, transporeon_id, rate_card_source_file):
-    lane_from, lane_to = lane_validity(lane)
-    if not (lane_from and lane_to):
-        return
-    for cost in lane.get("rates", []):
-        name = str(cost.get("cost_name", ""))
-        if not (name.startswith("BAF Fee") or name.startswith("EU ETS Fee")):
+def build_ets_update_windows_by_tid(etsbaf_updates):
+    """Transporeon ID -> list of (from, to) periods that carried ETS rates."""
+    windows = {}
+    for upd in etsbaf_updates:
+        route = upd.get("route", {})
+        tid = route.get("Transporeon ID")
+        if not tid:
             continue
-        c_from, c_to = cost_validity(cost)
-        if not all([c_from, c_to]):
+        upd_from = parse_yyyymmdd(route.get("RATE_EFFECTIVE_DATE__C"))
+        upd_to = parse_yyyymmdd(route.get("RATE_EXPIRATION_DATE__C"))
+        if not (upd_from and upd_to):
             continue
-        if periods_intersect(lane_from, lane_to, c_from, c_to):
+        has_ets = any(str(ur.get("charge_code", "")).lower() == "ets" for ur in upd.get("rates", []))
+        if not has_ets:
             continue
-        cost["currency"] = None
-        cost["p_unit"] = None
-        cost["flat_min"] = None
-        cost.pop("update_note", None)
+        windows.setdefault(tid, []).append((upd_from, upd_to))
+    return windows
+
+
+def cleanup_ets_filled_on_non_overlapping_lanes(records, ets_windows_by_tid):
+    """
+    Safety net after validity splits: if an EU ETS rate was written this run
+    ((updated)/(new)) on a lane that does not intersect any ETS update window
+    for that Transporeon ID, clear the filled values and leave the stub empty.
+    """
+    for lane in records:
+        tid = (lane.get("route") or {}).get("Transporeon ID")
+        windows = ets_windows_by_tid.get(tid) or []
+        if not windows:
+            continue
+        lane_from, lane_to = lane_validity(lane)
+        if not (lane_from and lane_to):
+            continue
+        if any(periods_intersect(lane_from, lane_to, f, t) for f, t in windows):
+            continue
+        for cost in lane.get("rates", []):
+            name = str(cost.get("cost_name", ""))
+            if not name.startswith("EU ETS Fee"):
+                continue
+            if cost.get("update_note") not in {"(updated)", "(new)"}:
+                continue
+            cost["currency"] = None
+            cost["p_unit"] = None
+            cost["flat_min"] = None
+            cost.pop("update_note", None)
 
 
 def find_matching_lanes(records, transporeon_id, rate_card_source_file):
@@ -471,14 +511,6 @@ def update_or_create_cost_block(lane, update_rate, upd_from, upd_to, all_records
     return True
 
 
-def container_sort_key(container_value):
-    if not container_value:
-        return 999
-    raw = str(container_value).replace("CNTR", "")
-    order = {"22G0": 22, "25G0": 25, "42G0": 42, "45G0": 45, "52G0": 52}
-    return order.get(raw, 999)
-
-
 def cost_group_sort_key(cost_name):
     name = str(cost_name or "")
     if name.startswith("BAF Fee"):
@@ -486,6 +518,16 @@ def cost_group_sort_key(cost_name):
     if name.startswith("EU ETS Fee"):
         return 1
     return 2
+
+
+def baf_ets_container_for_sort(cost):
+    name = str(cost.get("cost_name") or "")
+    container = str(
+        extract_container_from_cost_title(name)
+        or cost.get("container_type")
+        or ""
+    ).strip().upper()
+    return container
 
 
 def is_non_equipment_baf_ets(cost):
@@ -498,11 +540,7 @@ def is_non_equipment_baf_ets(cost):
     name = str(cost.get("cost_name") or "")
     if not (name.startswith("BAF Fee") or name.startswith("EU ETS Fee")):
         return False
-    container = str(
-        extract_container_from_cost_title(name)
-        or cost.get("container_type")
-        or ""
-    ).strip().upper()
+    container = baf_ets_container_for_sort(cost)
     if container in {"", "NONE", "DFT", "FRK"}:
         return True
     if re.match(r"^(BAF Fee|EU ETS Fee) \(\d{2}\.\d{2}\.\d{4}", name):
@@ -510,14 +548,72 @@ def is_non_equipment_baf_ets(cost):
     return False
 
 
-def validity_sort_key(validity_period):
-    if not validity_period or "-" not in str(validity_period):
+def build_container_appearance_order(costs):
+    """
+    Rank equipment containers by first appearance in the original RA order.
+    Non-equipment (DFT/FRK/empty) are excluded from this map.
+    """
+    appearance = {}
+    for cost in costs:
+        if cost_group_sort_key(cost.get("cost_name")) not in (0, 1):
+            continue
+        if is_non_equipment_baf_ets(cost):
+            continue
+        container = baf_ets_container_for_sort(cost)
+        if not container or container in appearance:
+            continue
+        appearance[container] = len(appearance)
+    return appearance
+
+
+def extract_validity_range_from_cost_name(cost_name):
+    """Parse from-to dates from titles like 'BAF Fee (DFT 01.06.2026-14.07.2026)'."""
+    name = str(cost_name or "")
+    match = re.search(r"(\d{2}\.\d{2}\.\d{4})\s*-\s*(\d{2}\.\d{2}\.\d{4})", name)
+    if not match:
+        return (None, None)
+    return parse_ddmmyyyy(match.group(1)), parse_ddmmyyyy(match.group(2))
+
+
+def extract_validity_start_from_cost_name(cost_name):
+    start, _ = extract_validity_range_from_cost_name(cost_name)
+    return start
+
+
+def validity_sort_key(cost_name, validity_period=None):
+    """
+    Chronological key for BAF/EU ETS blocks.
+    Prefer the from-to range in the cost name brackets; only fall back to
+    validity_period when the title has no usable range.
+    """
+    start = extract_validity_start_from_cost_name(cost_name)
+    if start is None:
+        raw = str(validity_period or "").strip()
+        if raw and "-" in raw:
+            start_raw = raw.split("-", 1)[0].strip()
+            # Ignore incomplete forms like "to 14.07.2026".
+            if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", start_raw):
+                start = parse_ddmmyyyy(start_raw)
+    if start is None:
         return 99999999
-    start = str(validity_period).split("-", 1)[0].strip()
-    d = parse_ddmmyyyy(start)
-    if d is None:
-        return 99999999
-    return int(d.strftime("%Y%m%d"))
+    return int(start.strftime("%Y%m%d"))
+
+
+def cost_baf_ets_sort_key(cost, container_appearance, original_idx=0):
+    non_equipment = is_non_equipment_baf_ets(cost)
+    container = baf_ets_container_for_sort(cost)
+    if non_equipment:
+        container_rank = -1
+    else:
+        container_rank = container_appearance.get(container, 10_000 + original_idx)
+    return (
+        0 if non_equipment else 1,
+        container_rank,
+        cost_group_sort_key(cost.get("cost_name")),
+        validity_sort_key(cost.get("cost_name"), cost.get("validity_period")),
+        str(cost.get("cost_name", "")),
+        original_idx,
+    )
 
 
 def reorder_etsbaf_costs(lane):
@@ -526,27 +622,17 @@ def reorder_etsbaf_costs(lane):
         return
 
     groups = []
-    others = []
     for idx, cost in enumerate(rates):
         group = cost_group_sort_key(cost.get("cost_name"))
         if group in (0, 1):
             groups.append((idx, cost))
-        else:
-            others.append((idx, cost))
 
-    # Desired order:
-    # 1) non-equipment BAF/EU ETS (DFT / date-only), by family then validity
-    # 2) equipment BAF/EU ETS, per container -> BAF -> EU ETS -> validity
-    groups.sort(
-        key=lambda x: (
-            0 if is_non_equipment_baf_ets(x[1]) else 1,
-            0 if is_non_equipment_baf_ets(x[1]) else container_sort_key(x[1].get("container_type")),
-            cost_group_sort_key(x[1].get("cost_name")),
-            validity_sort_key(x[1].get("validity_period")),
-            str(x[1].get("cost_name", "")),
-            x[0],
-        )
-    )
+    # Aggressive BAF/EU ETS order:
+    # 1) non-equipment (DFT) first, chronological by name brackets
+    # 2) equipment in original RA container appearance order
+    #    -> BAF then EU ETS -> chronological by name brackets
+    container_appearance = build_container_appearance_order([c for _, c in groups])
+    groups.sort(key=lambda x: cost_baf_ets_sort_key(x[1], container_appearance, x[0]))
 
     if not groups:
         return
@@ -726,7 +812,8 @@ def main():
     records = previous.get("records", [])
     migrate_cost_names_in_records(records)
 
-    etsbaf_updates = [r for r in updates.get("records", []) if r.get("sheet_name") == "ETSBAF"]
+    all_update_records = updates.get("records", []) or []
+    etsbaf_updates = [r for r in all_update_records if r.get("sheet_name") == "ETSBAF"]
     if not etsbaf_updates:
         raise ValueError("No ETSBAF updates found in selected rate update JSON.")
 
@@ -736,6 +823,9 @@ def main():
         for upd in etsbaf_updates
         if not should_skip_route_update(upd.get("route", {}), rate_card_source)[0]
     ]
+    etsbaf_updates = filter_service_variant_conflicts(
+        etsbaf_updates, variant_catalog=all_update_records
+    )
 
     not_performed = []
 
@@ -772,6 +862,10 @@ def main():
             continue
 
         for lane in lanes:
+            if upd.get("route", {}).get("merged_KEY") or upd.get("route", {}).get(
+                "merged_SERVICE_C"
+            ):
+                stamp_variant_fields(lane, upd)
             for ur in upd.get("rates", []):
                 if str(ur.get("charge_code", "")).lower() not in {"baf", "ets"}:
                     continue
@@ -787,6 +881,9 @@ def main():
         remove_empty_updated_blocks(lane)
         dedupe_same_validity_costs(lane)
         cleanup_non_overlapping_etsbaf_values(lane)
+    cleanup_ets_filled_on_non_overlapping_lanes(
+        previous["records"], build_ets_update_windows_by_tid(etsbaf_updates)
+    )
     cleanup_plain_stubs_globally(previous["records"])
     previous["record_count"] = len(records)
     previous["update_context"] = {
@@ -813,4 +910,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        import traceback
+
+        traceback.print_exc()
+        raise
