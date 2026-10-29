@@ -143,6 +143,76 @@ def is_cost_within_rate_card(cost_validity, card_validity):
     return not (cost_end < card_start or cost_start > card_end)
 
 
+# ISO-like equipment codes (22G0, 42SOC, …). Canal/DFT/FRK stay out of this group.
+_EQUIPMENT_CONTAINER_RE = re.compile(r"^\d{2}[A-Z0-9]+$")
+
+_FEE_FAMILY_ORDER = (
+    "Base Rate",
+    "Destination Terminal Handling Fee",
+    "Origin Terminal Handling Fee",
+    "War Risk Fee",
+    "Dangerous Goods Fee",
+    "Pre-Carriage Fee",
+)
+
+
+def equipment_container_code(cost_name, container=None):
+    raw = str(
+        extract_container_from_cost_title(cost_name) or container or ""
+    ).strip().upper()
+    if _EQUIPMENT_CONTAINER_RE.match(raw):
+        return raw
+    return None
+
+
+def fee_family_name(cost_name):
+    text = str(cost_name or "")
+    if " (" in text:
+        return text.split(" (", 1)[0]
+    return text
+
+
+def fee_family_rank(cost_name):
+    family = fee_family_name(cost_name)
+    try:
+        return _FEE_FAMILY_ORDER.index(family)
+    except ValueError:
+        return len(_FEE_FAMILY_ORDER)
+
+
+def reorder_equipment_costs_alphabetically(cost_names, container_lookup=None):
+    """
+    Keep leading non-equipment costs as-is; regroup equipment-coded costs by
+    container alphabetically (42SOC before 45G0), fee family within container.
+    """
+    container_lookup = container_lookup or {}
+    prefix = []
+    equipment = []
+    suffix = []
+    seen_equipment = False
+    for name in cost_names:
+        cont = equipment_container_code(name, container_lookup.get(name))
+        if cont:
+            seen_equipment = True
+            equipment.append((cont, name))
+        elif not seen_equipment:
+            prefix.append(name)
+        else:
+            suffix.append(name)
+
+    by_container = {}
+    for cont, name in equipment:
+        by_container.setdefault(cont, []).append(name)
+
+    ordered_equipment = []
+    for cont in sorted(by_container.keys()):
+        group = by_container[cont]
+        group.sort(key=lambda n: (fee_family_rank(n), n))
+        ordered_equipment.extend(group)
+
+    return prefix + ordered_equipment + suffix
+
+
 def collect_cost_order(records, payload):
     card_validity = payload.get("rate_card_validity")
     seen = set()
@@ -252,6 +322,22 @@ def collect_cost_order(records, payload):
                 baseline.append(name)
     # Add any remaining non-special costs that did not appear in first lane.
     non_special = baseline + [n for n in first_seen if group_key(n) not in (0, 1) and n not in baseline]
+
+    # Plain War Risk Fee (no equipment) belongs immediately after SCANAL.
+    if "War Risk Fee" in non_special:
+        non_special = [n for n in non_special if n != "War Risk Fee"]
+        insert_at = len(non_special)
+        for i, name in enumerate(non_special):
+            if "SCANAL" in name or name.startswith("Suez Canal"):
+                insert_at = i + 1
+        non_special.insert(insert_at, "War Risk Fee")
+
+    # New equipment (e.g. 42SOC) must not stay after 45G0 just because it was appended.
+    container_lookup = {
+        n: cost_meta_for_sort[n]["container"] for n in non_special if n in cost_meta_for_sort
+    }
+    non_special = reorder_equipment_costs_alphabetically(non_special, container_lookup)
+
     ordered = non_special + special_sorted
     return ordered
 
