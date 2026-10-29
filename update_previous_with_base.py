@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 from copy import deepcopy
 from datetime import datetime, timedelta
@@ -13,7 +14,14 @@ from route_utils import (
     should_skip_route_update,
     trim_service,
 )
-from cost_utils import merge_metrics, migrate_cost_names_in_records, normalize_container_code, normalize_cost_title
+from cost_utils import (
+    ensure_equipment_rate_by,
+    merge_metrics,
+    migrate_cost_names_in_records,
+    normalize_container_code,
+    normalize_cost_title,
+    rate_by_for_container,
+)
 from service_variants import (
     filter_service_variant_conflicts,
     stamp_variant_fields,
@@ -185,6 +193,14 @@ FLAT_DFT_COST_MAP = {
         "rate_by": "Weight/chargeable kg",
         "metrics": ["currency", "p_unit"],
     },
+    # DFTROLL_TR_NONFRK_* → existing RoRo Fee (min → flat, rate → p/unit).
+    ("tr_nonfrk", "DFTROLL"): {
+        "cost_name": "RoRo Fee",
+        "container_type": None,
+        "rate_field": "p_unit",
+        "rate_by": "Weight/chargeable kg",
+        "metrics": ["currency", "flat_min", "p_unit"],
+    },
     ("war_risk", "DFTWM"): {
         "cost_name": "War Risk Fee",
         "container_type": None,
@@ -238,6 +254,7 @@ def map_charge_name(charge_code):
         "dcfs": "Destination CFS Fee",
         "fee": "Documentation Fee",
         "cogh": "Handled Goods Fee",
+        "tr_nonfrk": "RoRo Fee",
         "danger_good": "Dangerous Goods Fee",
         "pre_carr": "Pre-Carriage Fee",
         "pcanal_o": "Panama Canal Charge",
@@ -280,14 +297,7 @@ def find_cost_target(lane_costs, index, candidate_name, container):
 
 
 def map_rate_by(container_type):
-    mapping = {
-        "22G0": "Container/20FT",
-        "25G0": "Container/20HC",
-        "42G0": "Container/40FT",
-        "45G0": "Container/40HC",
-        "BASE_STAT_FRK": "Weight/chargeable kg",
-    }
-    return mapping.get(container_type, "Weight/chargeable kg")
+    return rate_by_for_container(container_type) or "Weight/chargeable kg"
 
 
 def build_cost_name(charge_code, container_type):
@@ -297,6 +307,11 @@ def build_cost_name(charge_code, container_type):
 
 def apply_rate_value_to_cost(target, update_rate, charge_code, container, flat_meta=None):
     """Write currency/min/rate onto the correct metric fields for the cost type."""
+    if flat_meta and flat_meta.get("metrics"):
+        target["metrics"] = merge_metrics(target.get("metrics"), flat_meta["metrics"])
+    if flat_meta and flat_meta.get("rate_by") and not target.get("rate_by"):
+        target["rate_by"] = flat_meta["rate_by"]
+
     target["currency"] = update_rate.get("currency")
     rate_value = update_rate.get("rate")
     min_value = None if should_ignore_min(charge_code, container) else update_rate.get("min")
@@ -351,12 +366,13 @@ def make_new_cost(charge_code, container_type, template_cost=None):
     if template_cost:
         if template_cost.get("metrics"):
             cost["metrics"] = list(template_cost["metrics"])
-        if template_cost.get("rate_by"):
+        if template_cost.get("rate_by") and not (flat_meta or {}).get("rate_by"):
             cost["rate_by"] = template_cost.get("rate_by")
         if template_cost.get("rule") is not None:
             cost["rule"] = template_cost.get("rule")
         if template_cost.get("apply_if"):
             cost["apply_if"] = template_cost.get("apply_if")
+    ensure_equipment_rate_by(cost)
     return cost
 
 
@@ -526,16 +542,88 @@ def build_new_lane(update_record, previous_records, base_rates_template, card_fr
     return lane
 
 
+_EQUIPMENT_CONTAINER_RE = re.compile(r"^\d{2}[A-Z0-9]+$")
+_FEE_FAMILY_ORDER = (
+    "Base Rate",
+    "Destination Terminal Handling Fee",
+    "Origin Terminal Handling Fee",
+    "War Risk Fee",
+    "Dangerous Goods Fee",
+    "Pre-Carriage Fee",
+)
+
+
+def _equipment_container_code(cost_name, container=None):
+    raw = str(container or "").strip().upper()
+    if not _EQUIPMENT_CONTAINER_RE.match(raw):
+        match = re.search(r"\(([^)]+)\)", str(cost_name or ""))
+        if match:
+            token = match.group(1).strip().split()[0].upper()
+            raw = str(normalize_container_code(token) or token)
+    if _EQUIPMENT_CONTAINER_RE.match(raw):
+        return raw
+    return None
+
+
+def _fee_family_rank(cost_name):
+    family = str(cost_name or "").split(" (", 1)[0]
+    try:
+        return _FEE_FAMILY_ORDER.index(family)
+    except ValueError:
+        return len(_FEE_FAMILY_ORDER)
+
+
 def find_insert_index_for_new_cost(base_rates_template, new_cost):
     cost_name = str(new_cost.get("cost_name", ""))
-    if cost_name.startswith("Base Rate ("):
-        last_war_risk = -1
+    container = new_cost.get("container_type")
+    # Plain War Risk Fee (no equipment) sits immediately after SCANAL.
+    if cost_name == "War Risk Fee" and container in (None, "", "None"):
+        last_scanal = -1
         for i, c in enumerate(base_rates_template):
             existing_name = str(c.get("cost_name", ""))
-            if existing_name.startswith("War Risk Fee (") and "BAF" not in existing_name and "ETS" not in existing_name:
-                last_war_risk = i
-        if last_war_risk >= 0:
-            return last_war_risk + 1
+            if "SCANAL" in existing_name or existing_name.startswith("Suez Canal"):
+                last_scanal = i
+        if last_scanal >= 0:
+            return last_scanal + 1
+
+    # Equipment costs (22G0, 42SOC, …): alphabetical container, fee-family within.
+    # Compare only within the same “band” (Base/THC/War Risk vs BAF/ETS) so a new
+    # OTHC is not pushed next to BAF Fee (45SOC) at the end of the sheet.
+    new_cont = _equipment_container_code(cost_name, container)
+    if new_cont:
+        new_rank = _fee_family_rank(cost_name)
+        new_is_baf_ets = cost_name.startswith("BAF Fee") or cost_name.startswith(
+            "EU ETS Fee"
+        )
+        insert_at = None
+        for i, c in enumerate(base_rates_template):
+            other_name = str(c.get("cost_name", ""))
+            other_is_baf_ets = other_name.startswith("BAF Fee") or other_name.startswith(
+                "EU ETS Fee"
+            )
+            if new_is_baf_ets != other_is_baf_ets:
+                continue
+            other_cont = _equipment_container_code(other_name, c.get("container_type"))
+            if not other_cont:
+                continue
+            if other_cont < new_cont:
+                insert_at = i + 1
+                continue
+            if other_cont > new_cont:
+                return i
+            if _fee_family_rank(other_name) <= new_rank:
+                insert_at = i + 1
+            else:
+                return i
+        if insert_at is not None:
+            return insert_at
+        if not new_is_baf_ets:
+            for i, c in enumerate(base_rates_template):
+                other_name = str(c.get("cost_name", ""))
+                if other_name.startswith("BAF Fee") or other_name.startswith("EU ETS Fee"):
+                    return i
+        return len(base_rates_template)
+
     return len(base_rates_template)
 
 
