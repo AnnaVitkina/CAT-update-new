@@ -15,10 +15,12 @@ from service_variants import (
 from cost_utils import (
     costs_same_family,
     ensure_cost_container_type,
+    ensure_equipment_rate_by,
     extract_container_from_cost_title,
     migrate_cost_names_in_records,
     normalize_container_code,
     normalize_cost_title,
+    rate_by_for_container,
     resolve_etsbaf_container,
 )
 
@@ -108,17 +110,6 @@ def target_cost_name(charge_code, container):
     if not charge or not container:
         return None
     return normalize_cost_title(f"{charge} ({container})")
-
-
-def rate_by_for_container(container):
-    mapping = {
-        "22G0": "Container/20FT",
-        "25G0": "Container/20HC",
-        "42G0": "Container/40FT",
-        "45G0": "Container/40HC",
-        "52G0": "Container/40HC",
-    }
-    return mapping.get(str(container), "")
 
 
 def full_cost_name(base_name, start_date, end_date):
@@ -258,13 +249,14 @@ def create_versioned_block(lane, base_name, container, update_rate, upd_from, up
         "apply_if": source.get("apply_if") or "Applies if invoiced by Carrier",
         "validity_period": f"{fmt(block_from)}-{fmt(block_to)}",
         "cost_to_prolong": source.get("cost_to_prolong"),
-        "rate_by": source.get("rate_by") or rate_by_for_container(container),
+        "rate_by": rate_by_for_container(container) or source.get("rate_by") or "",
         "rule": source.get("rule") or "Regular rule",
         "currency": update_rate.get("currency"),
         "flat_min": None,
         "p_unit": update_rate.get("rate"),
         "update_note": "(new)",
     }
+    ensure_equipment_rate_by(new_block)
     lane.setdefault("rates", []).append(new_block)
     return new_block
 
@@ -321,7 +313,7 @@ def create_ets_block(lane, base_name, container, update_rate, block_from, block_
         "apply_if": source.get("apply_if") or "Applies if invoiced by Carrier",
         "validity_period": f"{fmt(block_from)}-{fmt(block_to)}",
         "cost_to_prolong": source.get("cost_to_prolong"),
-        "rate_by": source.get("rate_by") or rate_by_for_container(container),
+        "rate_by": rate_by_for_container(container) or source.get("rate_by") or "",
         "rule": source.get("rule") or "Regular rule",
         "currency": update_rate.get("currency"),
         "flat_min": None,
@@ -332,6 +324,7 @@ def create_ets_block(lane, base_name, container, update_rate, block_from, block_
         new_block["metrics"] = list(source.get("metrics"))
     else:
         new_block["metrics"] = ["currency", "p_unit"]
+    ensure_equipment_rate_by(new_block)
     lane.setdefault("rates", []).append(new_block)
     return new_block
 
