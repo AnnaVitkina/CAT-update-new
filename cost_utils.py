@@ -40,6 +40,40 @@ def normalize_container_code(container):
     return CONTAINER_ALIASES.get(raw, raw)
 
 
+_EQUIPMENT_CONTAINER_RE = re.compile(r"^\d{2}[A-Z0-9]+$")
+
+
+def is_equipment_container(container):
+    return bool(_EQUIPMENT_CONTAINER_RE.match(str(container or "").strip().upper()))
+
+
+def rate_by_for_container(container):
+    """
+    Equipment ISO codes use Container/{code} (e.g. Container/42SOC).
+    Weight-based / DFT-style containers keep Weight/chargeable kg.
+    """
+    raw = str(container or "").strip().upper()
+    if is_equipment_container(raw):
+        return f"Container/{raw}"
+    if raw in {"BASE_STAT_FRK", "DFT", "FRK", "PCANAL", "SCANAL", "DFTROLL", "DFTWM", "DFTDOC"}:
+        return "Weight/chargeable kg"
+    if raw:
+        return "Weight/chargeable kg"
+    return ""
+
+
+def ensure_equipment_rate_by(cost):
+    """Force rate_by to Container/{container} for ISO equipment costs."""
+    if not cost:
+        return
+    container = normalize_container_code(
+        cost.get("container_type") or extract_container_from_cost_title(cost.get("cost_name"))
+    )
+    if is_equipment_container(container):
+        cost["container_type"] = container
+        cost["rate_by"] = rate_by_for_container(container)
+
+
 def extract_container_from_cost_title(title):
     if title in (None, ""):
         return None
@@ -121,3 +155,4 @@ def migrate_cost_names_in_records(records):
             if prolong:
                 cost["cost_to_prolong"] = normalize_cost_title(prolong)
             ensure_cost_container_type(cost)
+            ensure_equipment_rate_by(cost)
